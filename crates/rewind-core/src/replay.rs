@@ -421,15 +421,13 @@ fn compare_snapshots(
     let mut kind_mismatches = Vec::new();
     for path in original_paths.intersection(&replay_paths) {
         match (entry_kind(original, path), entry_kind(replay, path)) {
-            (Some("file"), Some("file")) => {
-                if original.files.get(path) != replay.files.get(path) {
-                    content_mismatches.push(path.clone());
-                }
+            (Some("file"), Some("file")) if original.files.get(path) != replay.files.get(path) => {
+                content_mismatches.push(path.clone());
             }
-            (Some("symlink"), Some("symlink")) => {
-                if original.symlinks.get(path) != replay.symlinks.get(path) {
-                    content_mismatches.push(path.clone());
-                }
+            (Some("symlink"), Some("symlink"))
+                if original.symlinks.get(path) != replay.symlinks.get(path) =>
+            {
+                content_mismatches.push(path.clone());
             }
             (left, right) if left != right => kind_mismatches.push(path.clone()),
             _ => {}
