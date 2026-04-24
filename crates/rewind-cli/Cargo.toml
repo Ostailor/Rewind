@@ -1,0 +1,15 @@
+[package]
+name = "rewind-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "rewind"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+chrono = { workspace = true }
+clap = { workspace = true }
+rewind-core = { path = "../rewind-core" }

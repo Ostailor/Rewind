@@ -1,0 +1,35 @@
+[package]
+name = "rewind-workspace"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+members = [
+    "crates/rewind-cli",
+    "crates/rewind-core",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive"] }
+rusqlite = { version = "0.31", features = ["bundled"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+walkdir = "2"
+
+[dev-dependencies]
+anyhow = { workspace = true }
+rewind-core = { path = "crates/rewind-core" }
+rusqlite = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }

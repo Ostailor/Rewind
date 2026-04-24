@@ -1,0 +1,8 @@
+/target/
+/.rewind/
+/.omx/
+AGENTS.md
+.codex/
+.claude/
+.gemini/
+.DS_Store
