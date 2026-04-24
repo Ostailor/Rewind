@@ -1,17 +1,23 @@
 pub mod checkout;
 pub mod checkpoint;
 pub mod commit;
+pub mod config;
 pub mod diff;
 pub mod forensics;
 pub mod history;
+pub mod ignore;
 pub mod init;
 pub mod integrity;
 pub mod object_store;
 pub mod path_safety;
+pub mod provenance;
+pub mod replay;
+pub mod repo;
 pub mod restore;
 pub mod run;
 pub mod snapshot;
 pub mod status;
+pub mod trace;
 pub mod transaction;
 pub mod tui_model;
 

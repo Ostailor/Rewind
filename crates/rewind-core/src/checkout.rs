@@ -145,6 +145,8 @@ fn insert_checkout_event(
             started_dirty: false,
             timestamp: &timestamp,
             command: &target.command(),
+            command_argv_json: None,
+            command_cwd_relative: ".",
             exit_code: 0,
             before_snapshot: before_snapshot_id,
             after_snapshot: &after.id,

@@ -1,6 +1,7 @@
-use crate::diff::{diff_snapshots, SnapshotDiff};
+use crate::diff::SnapshotDiff;
 use crate::history;
-use crate::snapshot::{create_snapshot, load_snapshot, scan_worktree, write_snapshot};
+use crate::snapshot::{create_snapshot, load_snapshot, write_snapshot};
+use crate::status::compare_current_to_head;
 use crate::transaction;
 use anyhow::{Context, Result};
 use chrono::Utc;
@@ -19,8 +20,8 @@ pub fn commit_worktree(project_dir: &Path, message: &str, dry_run: bool) -> Resu
     let head_snapshot = history::get_head_snapshot(&conn)?
         .context("workspace has no head snapshot; run `rewind init` again")?;
     let head = load_snapshot(project_dir, &head_snapshot)?;
-    let current = scan_worktree(project_dir)?;
-    let diff = diff_snapshots(&head, &current);
+    let status = compare_current_to_head(project_dir, &head_snapshot, &head)?;
+    let diff = status.diff;
 
     if diff.changes.is_empty() && diff.added_dirs.is_empty() && diff.deleted_dirs.is_empty() {
         return Ok(CommitOutcome::Clean);
@@ -43,6 +44,8 @@ pub fn commit_worktree(project_dir: &Path, message: &str, dry_run: bool) -> Resu
             started_dirty: false,
             timestamp: &timestamp,
             command: &command,
+            command_argv_json: None,
+            command_cwd_relative: ".",
             exit_code: 0,
             before_snapshot: &head_snapshot,
             after_snapshot: &after.id,

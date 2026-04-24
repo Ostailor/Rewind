@@ -5,6 +5,7 @@ use crate::integrity::StorageStats;
 use crate::object_store::ObjectStore;
 use crate::snapshot::load_snapshot;
 use crate::status;
+use crate::trace;
 use crate::REWIND_DIR;
 use anyhow::{Context, Result};
 use std::fs;
@@ -44,6 +45,9 @@ pub struct TuiEvent {
     pub after_snapshot: String,
     pub undone: bool,
     pub started_dirty: bool,
+    pub trace_status: Option<String>,
+    pub command_argv_json: Option<String>,
+    pub command_cwd_relative: String,
 }
 
 #[derive(Debug, Clone)]
@@ -66,9 +70,10 @@ pub fn build_model(project_dir: &Path, selected_event_id: Option<i64>) -> Result
     let conn = history::ensure_initialized(project_dir)?;
     let head_snapshot = history::get_head_snapshot(&conn)?
         .context("workspace has no head snapshot; run `rewind init` again")?;
+    let trace_statuses = trace::trace_statuses(&conn)?;
     let events = history::list_events(&conn)?
         .into_iter()
-        .map(tui_event)
+        .map(|event| tui_event(event, &trace_statuses))
         .collect::<Vec<_>>();
     let selected_id = selected_event_id.or_else(|| events.last().map(|event| event.id));
     let selected_event = if let Some(event_id) = selected_id {
@@ -106,7 +111,8 @@ pub fn build_model(project_dir: &Path, selected_event_id: Option<i64>) -> Result
     })
 }
 
-fn tui_event(event: Event) -> TuiEvent {
+fn tui_event(event: Event, trace_statuses: &std::collections::BTreeMap<i64, String>) -> TuiEvent {
+    let trace_status = trace_statuses.get(&event.id).cloned();
     TuiEvent {
         id: event.id,
         kind: event.kind,
@@ -115,6 +121,9 @@ fn tui_event(event: Event) -> TuiEvent {
         after_snapshot: event.after_snapshot,
         undone: event.undone,
         started_dirty: event.started_dirty,
+        trace_status,
+        command_argv_json: event.command_argv_json,
+        command_cwd_relative: event.command_cwd_relative,
     }
 }
 

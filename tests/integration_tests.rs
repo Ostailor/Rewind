@@ -4,6 +4,7 @@ use rewind_core::path_safety::validate_relative_path;
 use rewind_core::snapshot::{create_snapshot, write_snapshot};
 use rusqlite::Connection;
 use serde_json::{json, Value};
+use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
@@ -87,6 +88,62 @@ impl Lab {
         Ok(conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
     }
 
+    fn trace_count(&self) -> Result<i64> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        Ok(conn.query_row("SELECT COUNT(*) FROM command_traces", [], |row| row.get(0))?)
+    }
+
+    fn insert_captured_trace(&self, event_id: i64, path: &str) -> Result<i64> {
+        self.insert_trace_access(event_id, path, "openat", "read")
+    }
+
+    fn insert_trace_access(
+        &self,
+        event_id: i64,
+        path: &str,
+        operation: &str,
+        access_kind: &str,
+    ) -> Result<i64> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        let trace_id = match conn.query_row(
+            "SELECT id FROM command_traces WHERE event_id = ?1 ORDER BY id DESC LIMIT 1",
+            [event_id],
+            |row| row.get::<_, i64>(0),
+        ) {
+            Ok(trace_id) => trace_id,
+            Err(rusqlite::Error::QueryReturnedNoRows) => {
+                conn.execute(
+                    "INSERT INTO command_traces (
+                        event_id, tracer, status, started_at, ended_at, raw_trace_path,
+                        outside_workspace_ops, parse_error
+                     ) VALUES (?1, 'strace', 'captured', 'now', 'later', NULL, 2, NULL)",
+                    [event_id],
+                )?;
+                conn.last_insert_rowid()
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let seq: i64 = conn.query_row(
+            "SELECT COALESCE(MAX(seq), 0) + 1 FROM trace_file_events WHERE trace_id = ?1",
+            [trace_id],
+            |row| row.get(0),
+        )?;
+        conn.execute(
+            "INSERT INTO trace_file_events (
+                trace_id, seq, timestamp, pid, operation, path, path2,
+                within_workspace, result, errno, access_kind
+             ) VALUES (?1, ?2, '10:00:00', 1234, ?3, ?4, NULL, 1, '3', NULL, ?5)",
+            (trace_id, seq, operation, path, access_kind),
+        )?;
+        conn.execute(
+            "INSERT INTO trace_processes (
+                trace_id, pid, parent_pid, operation, executable, timestamp, result
+             ) VALUES (?1, 1234, NULL, 'execve', 'sh', '10:00:00', '0')",
+            [trace_id],
+        )?;
+        Ok(trace_id)
+    }
+
     fn first_event_counts(&self) -> Result<(i64, i64, i64)> {
         let conn = Connection::open(self.path().join(".rewind/events.db"))?;
         Ok(conn.query_row(
@@ -151,6 +208,55 @@ impl Lab {
         Ok(started_dirty != 0)
     }
 
+    fn event_replay_metadata(&self, event_id: i64) -> Result<(Option<String>, String)> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        Ok(conn.query_row(
+            "SELECT command_argv_json, command_cwd_relative FROM events WHERE id = ?1",
+            [event_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?)
+    }
+
+    fn clear_event_argv(&self, event_id: i64) -> Result<()> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        conn.execute(
+            "UPDATE events SET command_argv_json = NULL WHERE id = ?1",
+            [event_id],
+        )?;
+        Ok(())
+    }
+
+    fn set_event_argv(&self, event_id: i64, argv: &[&str]) -> Result<()> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        let argv_json = serde_json::to_string(argv)?;
+        conn.execute(
+            "UPDATE events SET command_argv_json = ?1 WHERE id = ?2",
+            (&argv_json, event_id),
+        )?;
+        Ok(())
+    }
+
+    fn set_event_cwd(&self, event_id: i64, cwd: &str) -> Result<()> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        conn.execute(
+            "UPDATE events SET command_cwd_relative = ?1 WHERE id = ?2",
+            (cwd, event_id),
+        )?;
+        Ok(())
+    }
+
+    fn insert_trace_with_raw_path(&self, event_id: i64, raw_trace_path: &str) -> Result<()> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        conn.execute(
+            "INSERT INTO command_traces (
+                event_id, tracer, status, started_at, ended_at, raw_trace_path,
+                outside_workspace_ops, parse_error
+             ) VALUES (?1, 'strace', 'captured', 'now', 'later', ?2, 0, NULL)",
+            (event_id, raw_trace_path),
+        )?;
+        Ok(())
+    }
+
     fn file_change_count(&self, event_id: i64, change_type: &str) -> Result<i64> {
         let conn = Connection::open(self.path().join(".rewind/events.db"))?;
         Ok(conn.query_row(
@@ -205,6 +311,45 @@ impl Lab {
         self.path().join(".rewind/journal/active.json")
     }
 
+    fn repo_manifest_path(&self) -> PathBuf {
+        self.path().join(".rewind/repo.json")
+    }
+
+    fn db_schema_version(&self) -> Result<Option<String>> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        match conn.query_row(
+            "SELECT value FROM schema_meta WHERE key = 'db_schema_version'",
+            [],
+            |row| row.get::<_, String>(0),
+        ) {
+            Ok(version) => Ok(Some(version)),
+            Err(rusqlite::Error::SqliteFailure(_, _))
+            | Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+            Err(error) => Err(error.into()),
+        }
+    }
+
+    fn remove_repo_format_metadata(&self) -> Result<()> {
+        fs::remove_file(self.repo_manifest_path())?;
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        conn.execute("DROP TABLE IF EXISTS schema_meta", [])?;
+        Ok(())
+    }
+
+    fn set_db_schema_version(&self, version: &str) -> Result<()> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        conn.execute(
+            "UPDATE schema_meta SET value = ?1 WHERE key = 'db_schema_version'",
+            [version],
+        )?;
+        Ok(())
+    }
+
+    fn write_repo_manifest_value(&self, value: &Value) -> Result<()> {
+        fs::write(self.repo_manifest_path(), serde_json::to_vec_pretty(value)?)?;
+        Ok(())
+    }
+
     fn completed_journal_count(&self) -> Result<usize> {
         let path = self.path().join(".rewind/journal/completed");
         if !path.exists() {
@@ -252,6 +397,18 @@ impl Lab {
     }
 }
 
+fn replay_temp_dirs(event_id: i64) -> Result<BTreeSet<PathBuf>> {
+    let prefix = format!("rewind-replay-{event_id}-");
+    let mut dirs = BTreeSet::new();
+    for entry in fs::read_dir(std::env::temp_dir())? {
+        let entry = entry?;
+        if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            dirs.insert(entry.path());
+        }
+    }
+    Ok(dirs)
+}
+
 #[test]
 fn init_creates_expected_structure() -> Result<()> {
     let lab = Lab::new();
@@ -262,6 +419,1046 @@ fn init_creates_expected_structure() -> Result<()> {
     assert!(lab.path().join(".rewind/objects").is_dir());
     assert!(lab.path().join(".rewind/snapshots").is_dir());
     assert!(lab.path().join(".rewind/events.db").is_file());
+    Ok(())
+}
+
+#[test]
+fn repo_format_commands_report_current_repo_and_are_read_only() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    assert!(lab.repo_manifest_path().is_file());
+    assert_eq!(lab.db_schema_version()?.as_deref(), Some("1"));
+
+    let repo_info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(repo_info.contains("Migration status:     current"));
+    assert!(repo_info.contains("Format version:       2"));
+    assert!(repo_info.contains("DB schema version:    1"));
+
+    let doctor = String::from_utf8(lab.rewind(&["doctor"])?.stdout)?;
+    assert!(doctor.contains("Rewind doctor: OK"));
+    assert!(doctor.contains("Repo format:        current"));
+
+    let check = String::from_utf8(lab.rewind(&["migrate", "--check"])?.stdout)?;
+    assert!(check.contains("This Rewind repo is current."));
+
+    let stats = String::from_utf8(lab.rewind(&["stats"])?.stdout)?;
+    assert!(stats.contains("Repo:"));
+    assert!(stats.contains("migration status: current"));
+    let tui = String::from_utf8(lab.rewind(&["tui", "--once"])?.stdout)?;
+    assert!(tui.contains("Repo: format 2 / schema 1 (current)"));
+
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert!(!lab.active_journal_path().exists());
+    Ok(())
+}
+
+#[test]
+fn legacy_repo_is_detected_migrated_and_commands_work_afterward() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let head_before = lab.head_snapshot()?;
+    let events_before = lab.event_count()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    let checkpoints_before = lab.checkpoint_count()?;
+    let tracked_before = fs::read_to_string(lab.path().join("notes.txt"))?;
+    lab.remove_repo_format_metadata()?;
+
+    let repo_info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(repo_info.contains("Migration status:     needs migration"));
+    assert!(repo_info.contains("Suggested command:    rewind migrate"));
+
+    let doctor = lab.rewind_raw(&["doctor"])?;
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("Suggested action:   rewind migrate"));
+
+    let check = lab.rewind_raw(&["migrate", "--check"])?;
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("needs migration"));
+
+    for args in [
+        vec!["status"],
+        vec!["history"],
+        vec!["tui", "--once"],
+        vec!["run", "--", "sh", "-c", "echo nope > nope.txt"],
+    ] {
+        let output = lab.rewind_raw(&args)?;
+        assert!(!output.status.success());
+        assert!(String::from_utf8_lossy(&output.stderr).contains("rewind migrate"));
+    }
+    assert!(!lab.path().join("nope.txt").exists());
+
+    let migrate = String::from_utf8(lab.rewind(&["migrate"])?.stdout)?;
+    assert!(migrate.contains("Migration complete."));
+    assert!(lab.repo_manifest_path().is_file());
+    assert_eq!(lab.db_schema_version()?.as_deref(), Some("1"));
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert_eq!(lab.checkpoint_count()?, checkpoints_before);
+    assert_eq!(
+        fs::read_to_string(lab.path().join("notes.txt"))?,
+        tracked_before
+    );
+
+    let current = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(current.contains("Migration status:     current"));
+    assert!(lab.rewind(&["status"])?.status.success());
+    assert!(lab.rewind(&["history"])?.status.success());
+    assert!(lab.rewind(&["verify"])?.status.success());
+
+    let second = String::from_utf8(lab.rewind(&["migrate"])?.stdout)?;
+    assert!(second.contains("already current"));
+    Ok(())
+}
+
+#[test]
+fn format_one_repo_requires_metadata_only_migration_to_format_two() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    let tracked_before = fs::read_to_string(lab.path().join("notes.txt"))?;
+
+    let old_manifest = json!({
+        "format_version": 1,
+        "db_schema_version": 1,
+        "repo_id": "format-one",
+        "created_at": "2026-04-24T10:00:00Z",
+        "created_by_version": "0.14.0",
+        "last_migrated_at": "2026-04-24T10:00:00Z",
+        "last_migrated_by_version": "0.14.0"
+    });
+    lab.write_repo_manifest_value(&old_manifest)?;
+
+    let status = lab.rewind_raw(&["status"])?;
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("rewind migrate"));
+
+    let check = lab.rewind_raw(&["migrate", "--check"])?;
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("needs migration"));
+
+    let migrate = String::from_utf8(lab.rewind(&["migrate"])?.stdout)?;
+    assert!(migrate.contains("Migration complete."));
+    let info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(info.contains("Format version:       2"));
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert_eq!(
+        fs::read_to_string(lab.path().join("notes.txt"))?,
+        tracked_before
+    );
+    Ok(())
+}
+
+#[test]
+fn read_only_repo_format_commands_do_not_create_missing_events_db() -> Result<()> {
+    let lab = Lab::new();
+    fs::create_dir_all(lab.path().join(".rewind/objects"))?;
+    fs::create_dir_all(lab.path().join(".rewind/snapshots"))?;
+    let db_path = lab.path().join(".rewind/events.db");
+    assert!(!db_path.exists());
+
+    let repo_info = lab.rewind_raw(&["repo-info"])?;
+    assert!(repo_info.status.success());
+    assert!(String::from_utf8_lossy(&repo_info.stdout).contains("needs migration"));
+    assert!(!db_path.exists());
+
+    let doctor = lab.rewind_raw(&["doctor"])?;
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("rewind migrate"));
+    assert!(!db_path.exists());
+
+    let check = lab.rewind_raw(&["migrate", "--check"])?;
+    assert!(!check.status.success());
+    assert!(String::from_utf8_lossy(&check.stdout).contains("needs migration"));
+    assert!(!db_path.exists());
+
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("needs migration"));
+    assert!(!db_path.exists());
+    Ok(())
+}
+
+#[test]
+fn invalid_and_future_repo_metadata_are_rejected_clearly() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+
+    fs::write(lab.repo_manifest_path(), "{bad json")?;
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("invalid"));
+
+    let status = lab.rewind_raw(&["status"])?;
+    assert!(!status.status.success());
+    assert!(String::from_utf8_lossy(&status.stderr).contains("invalid format metadata"));
+
+    let future = json!({
+        "format_version": 3,
+        "db_schema_version": 1,
+        "repo_id": "future",
+        "created_at": "2026-04-24T10:00:00Z",
+        "created_by_version": "9.9.9",
+        "last_migrated_at": "2026-04-24T10:00:00Z",
+        "last_migrated_by_version": "9.9.9"
+    });
+    lab.write_repo_manifest_value(&future)?;
+    let info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(info.contains("incompatible future format"));
+    let mutating = lab.rewind_raw(&["run", "--", "sh", "-c", "echo no > no.txt"])?;
+    assert!(!mutating.status.success());
+    assert!(String::from_utf8_lossy(&mutating.stderr).contains("newer unsupported format"));
+
+    let empty_repo_id = json!({
+        "format_version": 2,
+        "db_schema_version": 1,
+        "repo_id": "",
+        "created_at": "2026-04-24T10:00:00Z",
+        "created_by_version": "0.13.0",
+        "last_migrated_at": "2026-04-24T10:00:00Z",
+        "last_migrated_by_version": "0.13.0"
+    });
+    lab.write_repo_manifest_value(&empty_repo_id)?;
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("repo_id"));
+
+    let current_manifest = json!({
+        "format_version": 2,
+        "db_schema_version": 1,
+        "repo_id": "mismatch",
+        "created_at": "2026-04-24T10:00:00Z",
+        "created_by_version": "0.13.0",
+        "last_migrated_at": "2026-04-24T10:00:00Z",
+        "last_migrated_by_version": "0.13.0"
+    });
+    lab.write_repo_manifest_value(&current_manifest)?;
+    lab.set_db_schema_version("0")?;
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("does not match"));
+    Ok(())
+}
+
+#[test]
+fn migrate_refuses_active_journal_and_info_doctor_report_it() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+
+    let migrate = lab.rewind_raw(&["migrate"])?;
+    assert!(!migrate.status.success());
+    assert!(String::from_utf8_lossy(&migrate.stderr).contains("active Rewind transaction"));
+
+    let info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(info.contains("Active journal:       yes"));
+
+    let doctor = lab.rewind_raw(&["doctor"])?;
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("Active journal:     present"));
+    Ok(())
+}
+
+#[test]
+fn packaging_commands_work_outside_repo_and_report_release_metadata() -> Result<()> {
+    let lab = Lab::new();
+
+    let short_version = lab.rewind(&["--version"])?;
+    assert!(String::from_utf8(short_version.stdout)?.contains("rewind 1.0.0-rc.1"));
+
+    let version = String::from_utf8(lab.rewind(&["version"])?.stdout)?;
+    assert!(version.contains("CLI version:              1.0.0-rc.1"));
+    assert!(version.contains("Supported repo format:    2"));
+    assert!(version.contains("Supported DB schema:      1"));
+    assert!(version.contains("Git commit:"));
+
+    for shell in ["bash", "zsh", "fish", "powershell", "elvish"] {
+        let output = String::from_utf8(lab.rewind(&["completions", shell])?.stdout)?;
+        assert!(output.to_lowercase().contains("rewind"));
+    }
+
+    let invalid = lab.rewind_raw(&["completions", "invalid-shell"])?;
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("invalid"));
+
+    let man = String::from_utf8(lab.rewind(&["man"])?.stdout)?;
+    assert!(man.contains(".TH REWIND 1"));
+    assert!(man.contains("SAFETY NOTES"));
+    assert!(man.contains("SYNOPSIS"));
+    assert!(man.contains("Repository format 2 and DB schema 1"));
+
+    let env = String::from_utf8(lab.rewind(&["env"])?.stdout)?;
+    assert!(env.contains("Rewind environment"));
+    assert!(env.contains("detected:            no"));
+    assert!(env.contains("Supported repo format: 2"));
+
+    let help = String::from_utf8(lab.rewind(&["--help"])?.stdout)?;
+    assert!(help.contains("records workspace snapshots"));
+    for command in ["init", "run", "restore", "replay", "migrate", "self-test"] {
+        assert!(help.contains(command), "top-level help missing {command}");
+    }
+    for args in [
+        vec!["run", "--help"],
+        vec!["commit", "--help"],
+        vec!["undo", "--help"],
+        vec!["restore", "--help"],
+        vec!["checkout", "--help"],
+        vec!["recover", "--help"],
+        vec!["verify", "--help"],
+        vec!["gc", "--help"],
+        vec!["trace", "--help"],
+        vec!["replay", "--help"],
+        vec!["migrate", "--help"],
+        vec!["config", "show", "--help"],
+        vec!["self-test", "--help"],
+    ] {
+        let output = String::from_utf8(lab.rewind(&args)?.stdout)?;
+        assert!(output.contains("Usage:"), "{args:?} help missing usage");
+    }
+    let replay_help = String::from_utf8(lab.rewind(&["replay", "--help"])?.stdout)?;
+    assert!(replay_help.contains("Replay"));
+    assert!(replay_help.contains("not a security sandbox"));
+    Ok(())
+}
+
+#[test]
+fn packaging_commands_are_read_only_inside_current_repo() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    let checkpoints_before = lab.checkpoint_count()?;
+
+    for args in [
+        vec!["version"],
+        vec!["completions", "bash"],
+        vec!["man"],
+        vec!["env"],
+    ] {
+        lab.rewind(&args)?;
+    }
+
+    let env = String::from_utf8(lab.rewind(&["env"])?.stdout)?;
+    assert!(env.contains("status:              current"));
+    assert!(env.contains("repo format:         2"));
+    assert!(env.contains("active journal:      no"));
+    assert!(env.contains("ignore enabled:      yes"));
+
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert_eq!(lab.checkpoint_count()?, checkpoints_before);
+    assert!(!lab.active_journal_path().exists());
+    Ok(())
+}
+
+#[test]
+fn env_reports_active_journal_without_mutating_it() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+    assert!(lab.active_journal_path().exists());
+    let journal_before = fs::read(lab.active_journal_path())?;
+
+    let output = String::from_utf8(lab.rewind(&["env"])?.stdout)?;
+    assert!(output.contains("active journal:      yes"));
+    assert!(output.contains("status:              current"));
+    assert_eq!(fs::read(lab.active_journal_path())?, journal_before);
+    Ok(())
+}
+
+#[test]
+fn self_test_isolated_from_calling_repo_and_keep_preserves_artifacts() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    let output = String::from_utf8(lab.rewind(&["self-test"])?.stdout)?;
+    assert!(output.contains("Rewind self-test"));
+    assert!(output.contains("Result: ok"));
+
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert!(!lab.active_journal_path().exists());
+
+    let kept = String::from_utf8(lab.rewind(&["self-test", "--keep"])?.stdout)?;
+    let kept_path = kept
+        .lines()
+        .find_map(|line| line.strip_prefix("Kept temp dir: "))
+        .context("kept path line")?;
+    let kept_path = PathBuf::from(kept_path);
+    assert!(kept_path.join(".rewind").is_dir());
+    assert!(kept_path.join(".rewind/events.db").is_file());
+    assert!(!kept_path.join("notes.txt").exists());
+    fs::remove_dir_all(kept_path)?;
+    Ok(())
+}
+
+#[test]
+fn release_docs_and_examples_exist() -> Result<()> {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    assert!(root.join("CHANGELOG.md").is_file());
+    assert!(root.join("docs/COMMANDS.md").is_file());
+    assert!(root.join("docs/REPO_FORMAT.md").is_file());
+    assert!(root.join("docs/INSTALL.md").is_file());
+    assert!(root.join("docs/RELEASE.md").is_file());
+    assert!(root.join("docs/SAFETY.md").is_file());
+    assert!(root.join("docs/LIMITATIONS.md").is_file());
+    assert!(root.join("docs/TESTING.md").is_file());
+    assert!(root.join("scripts/ci-check.sh").is_file());
+    assert!(root.join("scripts/run-examples.sh").is_file());
+    for script in [
+        "examples/basic-time-travel.sh",
+        "examples/replay-demo.sh",
+        "examples/ignore-demo.sh",
+        "examples/recovery-demo.sh",
+        "examples/provenance-demo.sh",
+    ] {
+        let path = root.join(script);
+        assert!(path.is_file(), "{script} missing");
+        let text = fs::read_to_string(&path)?;
+        assert!(text.contains("mktemp"));
+    }
+    let readme = fs::read_to_string(root.join("README.md"))?;
+    for link in [
+        "docs/COMMANDS.md",
+        "docs/SAFETY.md",
+        "docs/LIMITATIONS.md",
+        "docs/REPO_FORMAT.md",
+        "docs/INSTALL.md",
+        "docs/RELEASE.md",
+        "docs/TESTING.md",
+    ] {
+        assert!(readme.contains(link), "README missing {link}");
+    }
+    assert!(readme.contains("rewind completions"));
+    assert!(readme.contains("rewind man"));
+    assert!(readme.contains("not security-safe"));
+    assert!(readme.contains("raw traces may contain sensitive"));
+    let changelog = fs::read_to_string(root.join("CHANGELOG.md"))?;
+    assert!(changelog.contains("1.0.0-rc.1"));
+    let safety = fs::read_to_string(root.join("docs/SAFETY.md"))?;
+    assert!(safety.contains("Command Safety Matrix"));
+    assert!(safety.contains("Mutates workspace?"));
+    let limitations = fs::read_to_string(root.join("docs/LIMITATIONS.md"))?;
+    assert!(limitations.contains("Unsupported special files"));
+    let release = fs::read_to_string(root.join("docs/RELEASE.md"))?;
+    assert!(release.contains("v1 RC Checklist"));
+    let ci = fs::read_to_string(root.join("scripts/ci-check.sh"))?;
+    assert!(ci.contains("cargo fmt --check"));
+    assert!(ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"));
+    assert!(ci.contains("cargo test --workspace"));
+    assert!(ci.contains("cargo run -p rewind-cli -- self-test"));
+    assert!(ci.contains("scripts/run-examples.sh"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn basic_example_script_runs_with_rewind_in_path() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let _guard = CARGO_RUN_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .expect("cargo run lock poisoned");
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let bin_dir = tempfile::tempdir()?;
+    let shim = bin_dir.path().join("rewind");
+    fs::write(
+        &shim,
+        format!(
+            "#!/usr/bin/env sh\nexec cargo run --quiet --manifest-path '{}' -p rewind-cli -- \"$@\"\n",
+            root.join("Cargo.toml").display()
+        ),
+    )?;
+    let mut permissions = fs::metadata(&shim)?.permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&shim, permissions)?;
+
+    let old_path = std::env::var("PATH").unwrap_or_default();
+    let path = format!("{}:{old_path}", bin_dir.path().display());
+    let output = Command::new(root.join("examples/basic-time-travel.sh"))
+        .env("PATH", path)
+        .output()
+        .context("running basic example")?;
+
+    assert!(
+        output.status.success(),
+        "stdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("notes.txt after undo"));
+    Ok(())
+}
+
+#[test]
+fn hardening_weird_filenames_round_trip_through_history() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::create_dir_all(lab.path().join("nested dir"))?;
+    fs::write(lab.path().join("space name.txt"), "space")?;
+    fs::write(lab.path().join("unicodé.txt"), "unicode")?;
+    fs::write(lab.path().join("-dash.txt"), "dash")?;
+    fs::write(lab.path().join("nested dir/file [1]!.txt"), "punct")?;
+    lab.rewind(&["commit", "-m", "weird filenames"])?;
+
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree clean."));
+
+    let diff = String::from_utf8(lab.rewind(&["diff", "1"])?.stdout)?;
+    assert!(diff.contains("space name.txt"));
+    assert!(diff.contains("unicodé.txt"));
+    assert!(diff.contains("-dash.txt"));
+    assert!(diff.contains("nested dir/file [1]!.txt"));
+
+    let cat = String::from_utf8(lab.rewind(&["cat", "./-dash.txt", "--after", "1"])?.stdout)?;
+    assert_eq!(cat, "dash");
+    let log = String::from_utf8(lab.rewind(&["log", "nested dir"])?.stdout)?;
+    assert!(log.contains("file [1]!.txt"));
+    let restore = String::from_utf8(
+        lab.rewind(&["restore", "space name.txt", "--after", "1", "--dry-run"])?
+            .stdout,
+    )?;
+    assert!(restore.contains("Nothing to restore.") || restore.contains("Restore plan"));
+    let checkout = String::from_utf8(
+        lab.rewind(&["checkout", "--after", "1", "--dry-run"])?
+            .stdout,
+    )?;
+    assert!(checkout.contains("worktree already at") || checkout.contains("Checkout plan"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn hardening_unix_newline_filename_is_recorded_and_readable() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let name = "line\nbreak.txt";
+    fs::write(lab.path().join(name), "newline-name")?;
+    lab.rewind(&["commit", "-m", "newline filename"])?;
+
+    let cat = String::from_utf8(lab.rewind(&["cat", name, "--after", "1"])?.stdout)?;
+    assert_eq!(cat, "newline-name");
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree clean."));
+    Ok(())
+}
+
+#[test]
+fn hardening_replay_cwd_and_trace_raw_paths_reject_workspace_escape() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+
+    lab.set_event_cwd(1, "../outside")?;
+    let replay = lab.rewind_raw(&["replay", "1", "--dry-run"])?;
+    assert!(!replay.status.success());
+    assert!(String::from_utf8_lossy(&replay.stderr).contains("command_cwd_relative"));
+    lab.set_event_cwd(1, ".")?;
+
+    lab.insert_trace_with_raw_path(1, ".rewind/traces/../events.db")?;
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    let stdout = String::from_utf8_lossy(&verify.stdout);
+    assert!(stdout.contains("raw path is outside .rewind/traces"));
+    Ok(())
+}
+
+#[test]
+fn hardening_journal_archive_id_cannot_escape_journal_directory() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+
+    let mut journal: Value = serde_json::from_str(&fs::read_to_string(lab.active_journal_path())?)?;
+    journal["id"] = json!("../../escape");
+    fs::write(
+        lab.active_journal_path(),
+        serde_json::to_vec_pretty(&journal)?,
+    )?;
+
+    let complete = String::from_utf8(lab.rewind(&["recover", "--complete"])?.stdout)?;
+    assert!(complete.contains("Rewind transaction completed."));
+    assert!(!lab.path().join(".rewind/escape.json").exists());
+    assert!(!lab.path().join(".rewind/journal/escape.json").exists());
+    assert!(lab
+        .path()
+        .join(".rewind/journal/completed/escape.json")
+        .exists());
+    assert!(!lab.active_journal_path().exists());
+    Ok(())
+}
+
+#[test]
+fn hardening_representative_read_only_commands_do_not_mutate_repo() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    lab.insert_captured_trace(1, "notes.txt")?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    let checkpoints_before = lab.checkpoint_count()?;
+
+    let commands = [
+        vec!["version"],
+        vec!["completions", "bash"],
+        vec!["man"],
+        vec!["env"],
+        vec!["config", "show"],
+        vec!["repo-info"],
+        vec!["doctor"],
+        vec!["migrate", "--check"],
+        vec!["status"],
+        vec!["status", "--ignored"],
+        vec!["history"],
+        vec!["timeline"],
+        vec!["show", "1"],
+        vec!["diff", "1"],
+        vec!["verify"],
+        vec!["verify", "--strict"],
+        vec!["stats"],
+        vec!["tui", "--once"],
+        vec!["recover", "--status"],
+        vec!["log", "notes.txt"],
+        vec!["cat", "notes.txt", "--after", "1"],
+        vec!["deleted"],
+        vec!["grep", "hello", "--history"],
+        vec!["trace", "1"],
+        vec!["explain", "1"],
+        vec!["why", "notes.txt"],
+        vec!["impact", "notes.txt"],
+        vec!["graph", "1"],
+        vec!["replay", "1", "--dry-run"],
+    ];
+
+    for args in commands {
+        let output = lab.rewind_raw(&args)?;
+        assert!(
+            output.status.success(),
+            "command {:?} failed\nstdout:\n{}\nstderr:\n{}",
+            args,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(lab.event_count()?, events_before, "{args:?} created event");
+        assert_eq!(lab.head_snapshot()?, head_before, "{args:?} changed head");
+        assert_eq!(
+            lab.snapshot_manifest_count()?,
+            snapshots_before,
+            "{args:?} wrote snapshot"
+        );
+        assert_eq!(lab.object_count()?, objects_before, "{args:?} wrote object");
+        assert_eq!(
+            lab.checkpoint_count()?,
+            checkpoints_before,
+            "{args:?} changed checkpoint"
+        );
+        assert!(
+            !lab.active_journal_path().exists(),
+            "{args:?} created journal"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn config_show_defaults_file_and_validation_are_clear_and_read_only() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    let output = String::from_utf8(lab.rewind(&["config", "show"])?.stdout)?;
+    assert!(output.contains("Config source:      file"));
+    assert!(output.contains("Ignore enabled:     yes"));
+    assert!(lab.path().join(".rewind/config.toml").is_file());
+
+    fs::remove_file(lab.path().join(".rewind/config.toml"))?;
+    let defaults = String::from_utf8(lab.rewind(&["config", "show"])?.stdout)?;
+    assert!(defaults.contains("Config source:      defaults"));
+    assert!(defaults.contains("Ignore file exists: no"));
+
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+
+    fs::write(
+        lab.path().join(".rewind/config.toml"),
+        "[ignore]\nunknown = true\n",
+    )?;
+    let invalid = lab.rewind_raw(&["config", "show"])?;
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("unsupported config key"));
+
+    for file_value in ["/tmp/rewindignore", "../outside", ".rewind/ignore"] {
+        fs::write(
+            lab.path().join(".rewind/config.toml"),
+            format!("[ignore]\nenabled = true\nfile = \"{file_value}\"\n"),
+        )?;
+        assert!(!lab.rewind_raw(&["config", "show"])?.status.success());
+    }
+    Ok(())
+}
+
+#[test]
+fn ignore_rules_hide_noise_but_status_ignored_lists_it() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(
+        lab.path().join(".rewindignore"),
+        "# comments are ignored\ncache.dat\ntarget/\n*.tmp\nnode_modules/\n",
+    )?;
+    fs::write(lab.path().join("cache.dat"), "cache\n")?;
+    fs::create_dir_all(lab.path().join("target/debug"))?;
+    fs::write(lab.path().join("target/debug/app"), "binary\n")?;
+    fs::write(lab.path().join("notes.tmp"), "tmp\n")?;
+    fs::create_dir_all(lab.path().join("src/node_modules"))?;
+    fs::write(lab.path().join("src/node_modules/pkg.txt"), "pkg\n")?;
+
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree dirty."));
+    assert!(status.contains(".rewindignore"));
+    assert!(!status.contains("cache.dat"));
+    assert!(!status.contains("target/debug/app"));
+
+    let ignored = String::from_utf8(lab.rewind(&["status", "--ignored"])?.stdout)?;
+    assert!(ignored.contains("Ignored:"));
+    assert!(ignored.contains("cache.dat"));
+    assert!(ignored.contains("target/debug/app"));
+    assert!(ignored.contains("notes.tmp"));
+    assert!(ignored.contains("src/node_modules/pkg.txt"));
+    assert!(!ignored.contains(".rewind/events.db"));
+
+    fs::write(lab.path().join(".rewindignore"), "!\n")?;
+    let invalid = lab.rewind_raw(&["status"])?;
+    assert!(!invalid.status.success());
+    assert!(String::from_utf8_lossy(&invalid.stderr).contains("Invalid ignore rules"));
+
+    fs::write(lab.path().join(".rewindignore"), ".rewind/\n")?;
+    let hard_excluded = String::from_utf8(lab.rewind(&["status", "--ignored"])?.stdout)?;
+    assert!(!hard_excluded.contains(".rewind/events.db"));
+    Ok(())
+}
+
+#[test]
+fn verify_doctor_and_repo_info_report_config_and_ignore_state() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join(".rewindignore"), "target/\n*.tmp\n")?;
+
+    let verify = String::from_utf8(lab.rewind(&["verify"])?.stdout)?;
+    assert!(verify.contains("Rewind verify: OK"));
+    assert!(verify.contains("Config:"));
+
+    let doctor = String::from_utf8(lab.rewind(&["doctor"])?.stdout)?;
+    assert!(doctor.contains("Rewind doctor: OK"));
+    assert!(doctor.contains("Config:             OK"));
+
+    let info = String::from_utf8(lab.rewind(&["repo-info"])?.stdout)?;
+    assert!(info.contains("Config source:"));
+    assert!(info.contains("file"));
+    assert!(info.contains("Ignore enabled:"));
+    assert!(info.contains("yes"));
+    assert!(info.contains("Ignore file exists:"));
+
+    fs::write(lab.path().join(".rewindignore"), "!\n")?;
+    let verify = lab.rewind_raw(&["verify"])?;
+    assert!(!verify.status.success());
+    assert!(String::from_utf8_lossy(&verify.stdout).contains("Invalid config/ignore rules"));
+
+    let doctor = lab.rewind_raw(&["doctor"])?;
+    assert!(!doctor.status.success());
+    assert!(String::from_utf8_lossy(&doctor.stdout).contains("Config:             invalid"));
+    Ok(())
+}
+
+#[test]
+fn ignored_untracked_paths_are_omitted_from_run_and_commit_snapshots() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join(".rewindignore"), "target/\n*.tmp\n")?;
+    lab.rewind(&["commit", "-m", "add ignore rules"])?;
+    fs::create_dir_all(lab.path().join("target"))?;
+    fs::write(lab.path().join("target/output.log"), "build\n")?;
+    fs::write(lab.path().join("scratch.tmp"), "tmp\n")?;
+
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree clean."));
+
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let (_, after_run) = lab.latest_event_snapshots()?;
+    let after_json = lab.load_snapshot_json(&after_run)?;
+    assert!(after_json["files"]["notes.txt"].is_object());
+    assert!(after_json["files"]["target/output.log"].is_null());
+    assert!(after_json["files"]["scratch.tmp"].is_null());
+
+    fs::write(lab.path().join("manual.txt"), "manual\n")?;
+    lab.rewind(&["commit", "-m", "manual"])?;
+    let (_, after_commit) = lab.latest_event_snapshots()?;
+    let after_json = lab.load_snapshot_json(&after_commit)?;
+    assert!(after_json["files"]["manual.txt"].is_object());
+    assert!(after_json["files"]["target/output.log"].is_null());
+    assert!(after_json["files"]["scratch.tmp"].is_null());
+    Ok(())
+}
+
+#[test]
+fn tracked_paths_that_become_ignored_are_carried_forward_without_fake_deletions() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&[
+        "sh",
+        "-c",
+        "mkdir -p logs && echo original > keep.log && echo nested > logs/keep.log",
+    ])?;
+
+    fs::write(lab.path().join(".rewindignore"), "*.log\n")?;
+    lab.rewind(&["commit", "-m", "ignore keep log"])?;
+    let commit_output = String::from_utf8(lab.rewind(&["show", "2"])?.stdout)?;
+    assert!(commit_output.contains(".rewindignore"));
+    assert!(!commit_output.contains("keep.log"));
+
+    let carried = String::from_utf8(lab.rewind(&["cat", "keep.log", "--after", "2"])?.stdout)?;
+    assert_eq!(carried, "original\n");
+    let nested = String::from_utf8(
+        lab.rewind(&["cat", "logs/keep.log", "--after", "2"])?
+            .stdout,
+    )?;
+    assert_eq!(nested, "nested\n");
+
+    fs::write(lab.path().join("keep.log"), "changed while ignored\n")?;
+    fs::write(
+        lab.path().join("logs/keep.log"),
+        "nested changed while ignored\n",
+    )?;
+    let clean = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(clean.contains("Rewind worktree clean."));
+
+    let log = String::from_utf8(lab.rewind(&["log", "keep.log"])?.stdout)?;
+    assert!(log.contains("created"));
+    let dry_restore = String::from_utf8(
+        lab.rewind(&["restore", "keep.log", "--after", "1", "--dry-run"])?
+            .stdout,
+    )?;
+    assert!(dry_restore.contains("Nothing to restore") || dry_restore.contains("Restore plan"));
+
+    fs::write(lab.path().join(".rewindignore"), "\n")?;
+    let dirty = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(dirty.contains("Modified:"));
+    assert!(dirty.contains("keep.log"));
+    assert!(dirty.contains("logs/keep.log"));
+    Ok(())
+}
+
+#[test]
+fn ignored_noise_does_not_block_run_commit_undo_or_checkout_preflights() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join(".rewindignore"), "target/\n")?;
+    lab.rewind(&["commit", "-m", "ignore target"])?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+    fs::create_dir_all(lab.path().join("target"))?;
+    fs::write(lab.path().join("target/noise.log"), "noise\n")?;
+
+    let run = lab.rewind_raw(&["run", "--", "sh", "-c", "echo ok > ok.txt"])?;
+    assert!(run.status.success());
+
+    fs::write(lab.path().join("manual.txt"), "manual\n")?;
+    let commit = lab.rewind_raw(&["commit", "-m", "manual"])?;
+    assert!(commit.status.success());
+
+    fs::write(lab.path().join("target/more.log"), "more\n")?;
+    let undo = lab.rewind_raw(&["undo", "--dry-run"])?;
+    assert!(undo.status.success());
+
+    let checkout = lab.rewind_raw(&["checkout", "--before", "2", "--dry-run"])?;
+    assert!(checkout.status.success());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn symlinks_and_executable_bits_are_snapshotted_diffed_and_undoable() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&[
+        "sh",
+        "-c",
+        "printf '#!/bin/sh\\necho hello\\n' > build.sh && chmod +x build.sh && ln -s build.sh latest-build",
+    ])?;
+    let (_, after_create) = lab.latest_event_snapshots()?;
+    let snapshot = lab.load_snapshot_json(&after_create)?;
+    assert_eq!(snapshot["manifest_version"], 2);
+    assert_eq!(snapshot["files"]["build.sh"]["executable"], true);
+    assert_eq!(snapshot["symlinks"]["latest-build"]["target"], "build.sh");
+
+    fs::remove_file(lab.path().join("latest-build"))?;
+    symlink("missing-target", lab.path().join("latest-build"))?;
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Modified:"));
+    assert!(status.contains("latest-build"));
+    lab.rewind(&["commit", "-m", "change symlink"])?;
+    let diff = String::from_utf8(lab.rewind(&["diff", "2"])?.stdout)?;
+    assert!(diff.contains("Symlink changes"));
+    assert!(diff.contains("build.sh -> missing-target"));
+
+    lab.rewind(&["undo"])?;
+    assert_eq!(
+        fs::read_link(lab.path().join("latest-build"))?,
+        PathBuf::from("build.sh")
+    );
+
+    let mut permissions = fs::metadata(lab.path().join("build.sh"))?.permissions();
+    permissions.set_mode(permissions.mode() & !0o111);
+    fs::set_permissions(lab.path().join("build.sh"), permissions)?;
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Modified:"));
+    assert!(status.contains("build.sh"));
+    lab.rewind(&["commit", "-m", "drop executable"])?;
+    let diff = String::from_utf8(lab.rewind(&["diff", "3"])?.stdout)?;
+    assert!(diff.contains("Mode changes"));
+    assert!(diff.contains("executable yes -> no"));
+    lab.rewind(&["undo"])?;
+    assert!(
+        fs::metadata(lab.path().join("build.sh"))?
+            .permissions()
+            .mode()
+            & 0o111
+            != 0
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn symlink_scans_do_not_follow_targets_and_ignore_uses_link_path() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let lab = Lab::new();
+    lab.init()?;
+    let outside = tempfile::tempdir()?;
+    fs::write(outside.path().join("secret.txt"), "outside\n")?;
+    symlink(outside.path(), lab.path().join("outside-link"))?;
+
+    lab.rewind(&["commit", "-m", "record symlink"])?;
+    let (_, after) = lab.latest_event_snapshots()?;
+    let snapshot = lab.load_snapshot_json(&after)?;
+    assert!(snapshot["symlinks"]["outside-link"]["target"]
+        .as_str()
+        .is_some_and(|target| target.contains(outside.path().to_string_lossy().as_ref())));
+    assert!(snapshot["files"]["outside-link/secret.txt"].is_null());
+
+    fs::write(lab.path().join(".rewindignore"), "ignored-link\n")?;
+    lab.rewind(&["commit", "-m", "ignore link path"])?;
+    symlink("build-output", lab.path().join("ignored-link"))?;
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree clean."));
+    let ignored = String::from_utf8(lab.rewind(&["status", "--ignored"])?.stdout)?;
+    assert!(ignored.contains("ignored-link"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn replay_materializes_and_compares_symlinks() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&[
+        "sh",
+        "-c",
+        "echo hello > target.txt && ln -s target.txt link.txt",
+    ])?;
+    let output = String::from_utf8(lab.rewind(&["replay", "1", "--compare"])?.stdout)?;
+    assert!(output.contains("Filesystem match: yes"));
+    assert!(output.contains("exact reproduction: yes"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn checkout_and_recovery_replace_symlink_with_directory_safely() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "ln -s missing tree"])?;
+    lab.run(&[
+        "sh",
+        "-c",
+        "rm tree && mkdir tree && echo data > tree/file.txt",
+    ])?;
+
+    lab.rewind(&["checkout", "--before", "2"])?;
+    assert_eq!(
+        fs::read_link(lab.path().join("tree"))?,
+        PathBuf::from("missing")
+    );
+
+    lab.rewind(&["checkout", "--after", "2"])?;
+    assert_eq!(
+        fs::read_to_string(lab.path().join("tree/file.txt"))?,
+        "data\n"
+    );
+
+    lab.rewind(&["checkout", "--before", "2"])?;
+    let stopped = lab.rewind_raw(&["checkout", "--after", "2", "--debug-stop-after-journal"])?;
+    assert!(!stopped.status.success());
+    assert!(lab.active_journal_path().exists());
+    lab.rewind(&["recover", "--complete"])?;
+    assert_eq!(
+        fs::read_to_string(lab.path().join("tree/file.txt"))?,
+        "data\n"
+    );
+    assert!(!lab.active_journal_path().exists());
     Ok(())
 }
 
@@ -2352,5 +3549,516 @@ fn tui_once_includes_forensic_suggestions_for_selected_event() -> Result<()> {
     assert!(output.contains("rewind log notes.txt"));
     assert!(output.contains("rewind cat notes.txt --before 2"));
     assert!(output.contains("rewind cat notes.txt --after 2"));
+    Ok(())
+}
+
+#[test]
+fn run_without_trace_and_trace_off_create_no_trace_metadata() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+
+    lab.run(&["sh", "-c", "echo normal > normal.txt"])?;
+    assert_eq!(lab.trace_count()?, 0);
+
+    lab.rewind(&["run", "--trace=off", "--", "sh", "-c", "echo off > off.txt"])?;
+    assert_eq!(lab.trace_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn trace_auto_succeeds_without_requiring_host_strace() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+
+    lab.rewind(&[
+        "run",
+        "--trace=auto",
+        "--",
+        "sh",
+        "-c",
+        "echo traced > traced.txt",
+    ])?;
+
+    assert_eq!(lab.event_count()?, 1);
+    let conn = Connection::open(lab.path().join(".rewind/events.db"))?;
+    let status: String = conn.query_row(
+        "SELECT status FROM command_traces WHERE event_id = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    assert!(status == "captured" || status == "unavailable" || status == "parse_error");
+    Ok(())
+}
+
+#[test]
+fn trace_strace_requires_available_strace_or_captures() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+
+    let output = lab.rewind_raw(&[
+        "run",
+        "--trace=strace",
+        "--",
+        "sh",
+        "-c",
+        "echo maybe > maybe.txt",
+    ])?;
+
+    if output.status.success() {
+        assert_eq!(lab.event_count()?, 1);
+        assert!(lab.trace_count()? >= 1);
+    } else {
+        assert_eq!(lab.event_count()?, 0);
+        assert!(!lab.path().join("maybe.txt").exists());
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("strace"));
+    }
+    Ok(())
+}
+
+#[test]
+fn trace_command_show_history_timeline_stats_and_tui_display_trace_metadata() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    lab.insert_captured_trace(1, "notes.txt")?;
+
+    let trace = String::from_utf8(lab.rewind(&["trace", "1"])?.stdout)?;
+    assert!(trace.contains("Trace for event 1"));
+    assert!(trace.contains("Status:  captured"));
+    assert!(trace.contains("notes.txt"));
+    assert!(trace.contains("execve"));
+
+    let files = String::from_utf8(lab.rewind(&["trace", "1", "--files"])?.stdout)?;
+    assert!(files.contains("Workspace file operations"));
+    assert!(files.contains("notes.txt"));
+    assert!(!files.contains("Processes:"));
+
+    let processes = String::from_utf8(lab.rewind(&["trace", "1", "--processes"])?.stdout)?;
+    assert!(processes.contains("Processes:"));
+    assert!(processes.contains("execve"));
+    assert!(!processes.contains("Workspace file operations"));
+
+    let show = String::from_utf8(lab.rewind(&["show", "1"])?.stdout)?;
+    assert!(show.contains("Trace:"));
+    assert!(show.contains("status: captured"));
+    assert!(show.contains("rewind trace 1"));
+
+    let history = String::from_utf8(lab.rewind(&["history"])?.stdout)?;
+    assert!(history.contains("captured"));
+    let timeline = String::from_utf8(lab.rewind(&["timeline"])?.stdout)?;
+    assert!(timeline.contains("captured"));
+    let stats = String::from_utf8(lab.rewind(&["stats"])?.stdout)?;
+    assert!(stats.contains("Traces:"));
+    assert!(stats.contains("captured:"));
+    let tui = String::from_utf8(lab.rewind(&["tui", "--once", "--selected", "1"])?.stdout)?;
+    assert!(tui.contains("Trace: captured"));
+    assert!(tui.contains("rewind trace 1"));
+    Ok(())
+}
+
+#[test]
+fn trace_reports_no_trace_and_log_include_trace_shows_trace_only_touches() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+
+    let none = String::from_utf8(lab.rewind(&["trace", "1"])?.stdout)?;
+    assert!(none.contains("No trace recorded for event 1."));
+
+    lab.insert_captured_trace(1, "notes.txt")?;
+    let log = String::from_utf8(lab.rewind(&["log", "notes.txt", "--include-trace"])?.stdout)?;
+    assert!(log.contains("created"));
+    assert!(log.contains("touched"));
+    assert!(log.contains("trace"));
+    Ok(())
+}
+
+#[test]
+fn verify_and_active_journal_behavior_include_traces() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+    lab.insert_captured_trace(1, "notes.txt")?;
+
+    let verify = String::from_utf8(lab.rewind(&["verify"])?.stdout)?;
+    assert!(verify.contains("Rewind verify: OK"));
+
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+    let blocked = lab.rewind_raw(&["run", "--trace=auto", "--", "sh", "-c", "echo no > no.txt"])?;
+    assert!(!blocked.status.success());
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("active Rewind transaction"));
+
+    let trace = lab.rewind_raw(&["trace", "1"])?;
+    assert!(trace.status.success());
+    assert!(String::from_utf8_lossy(&trace.stderr).contains("active recovery transaction"));
+    Ok(())
+}
+
+#[test]
+fn explain_why_impact_and_graph_use_trace_and_final_changes() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo config > config.toml"])?;
+    lab.run(&[
+        "sh",
+        "-c",
+        "cat config.toml >/dev/null && echo hello > notes.txt",
+    ])?;
+    lab.insert_trace_access(2, "config.toml", "openat", "read")?;
+    lab.insert_trace_access(2, "notes.txt", "openat", "write")?;
+
+    let explain = String::from_utf8(lab.rewind(&["explain", "2"])?.stdout)?;
+    assert!(explain.contains("Event 2 explanation"));
+    assert!(explain.contains("Created:"));
+    assert!(explain.contains("notes.txt"));
+    assert!(explain.contains("Trace:"));
+    assert!(explain.contains("Read:"));
+    assert!(explain.contains("config.toml"));
+    assert!(explain.contains("Changed and traced:"));
+    assert!(explain.contains("Traced but unchanged:"));
+
+    let why = String::from_utf8(lab.rewind(&["why", "notes.txt"])?.stdout)?;
+    assert!(why.contains("Why notes.txt?"));
+    assert!(why.contains("Current state: file at HEAD"));
+    assert!(why.contains("Last changed by event 2"));
+    assert!(why.contains("Trace:"));
+    assert!(why.contains("written"));
+
+    let impact = String::from_utf8(lab.rewind(&["impact", "config.toml"])?.stdout)?;
+    assert!(impact.contains("Trace-based impact for config.toml"));
+    assert!(impact.contains("read"));
+    assert!(impact.contains("Trace-based results only"));
+
+    let graph = String::from_utf8(lab.rewind(&["graph", "2"])?.stdout)?;
+    assert!(graph.contains("Event 2:"));
+    assert!(graph.contains("Processes"));
+    assert!(graph.contains("Inputs / reads"));
+    assert!(graph.contains("Outputs / final changes"));
+
+    let dot = String::from_utf8(lab.rewind(&["graph", "2", "--dot"])?.stdout)?;
+    assert!(dot.starts_with("digraph"));
+    assert!(dot.contains("event_2"));
+    assert!(!dot.contains("/etc/"));
+    Ok(())
+}
+
+#[test]
+fn provenance_commands_handle_missing_data_invalid_paths_and_are_read_only() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    let explain = String::from_utf8(lab.rewind(&["explain", "1"])?.stdout)?;
+    assert!(explain.contains("Trace: missing"));
+    assert!(explain.contains("Changed but not traced:"));
+
+    let unseen = String::from_utf8(lab.rewind(&["why", "missing.txt"])?.stdout)?;
+    assert!(unseen.contains("No event explains missing.txt."));
+
+    assert!(!lab.rewind_raw(&["explain", "99"])?.status.success());
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+
+    lab.run(&["rm", "notes.txt"])?;
+    let deleted = String::from_utf8(lab.rewind(&["why", "notes.txt"])?.stdout)?;
+    assert!(deleted.contains("Current state: missing at HEAD"));
+    assert!(deleted.contains("Last known deletion"));
+
+    for path in ["/absolute.txt", "../outside.txt", ".rewind/events.db"] {
+        assert!(!lab.rewind_raw(&["why", path])?.status.success());
+        assert!(!lab.rewind_raw(&["impact", path])?.status.success());
+    }
+
+    assert_eq!(lab.event_count()?, events_before + 1);
+    assert_ne!(lab.head_snapshot()?, head_before);
+    assert!(lab.object_count()? >= objects_before);
+    Ok(())
+}
+
+#[test]
+fn provenance_commands_warn_with_active_journal_and_tui_suggests_them() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo v1 > notes.txt"])?;
+    lab.run(&["sh", "-c", "echo v2 > notes.txt"])?;
+    lab.insert_trace_access(2, "notes.txt", "openat", "write")?;
+
+    let tui = String::from_utf8(lab.rewind(&["tui", "--once", "--selected", "2"])?.stdout)?;
+    assert!(tui.contains("rewind explain 2"));
+    assert!(tui.contains("rewind graph 2"));
+    assert!(tui.contains("rewind graph 2 --dot"));
+    assert!(tui.contains("rewind why notes.txt"));
+    assert!(tui.contains("rewind impact notes.txt"));
+
+    let show = String::from_utf8(lab.rewind(&["show", "2"])?.stdout)?;
+    assert!(show.contains("rewind explain 2"));
+    let trace = String::from_utf8(lab.rewind(&["trace", "2"])?.stdout)?;
+    assert!(trace.contains("rewind explain 2"));
+    let log = String::from_utf8(lab.rewind(&["log", "notes.txt"])?.stdout)?;
+    assert!(log.contains("rewind why notes.txt"));
+    assert!(log.contains("rewind impact notes.txt"));
+
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+    let output = lab.rewind_raw(&["explain", "2"])?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active recovery transaction"));
+    let output = lab.rewind_raw(&["why", "notes.txt"])?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active recovery transaction"));
+    let output = lab.rewind_raw(&["impact", "notes.txt"])?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active recovery transaction"));
+    let output = lab.rewind_raw(&["graph", "2"])?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active recovery transaction"));
+    Ok(())
+}
+
+#[test]
+fn run_captures_replay_metadata_and_verify_validates_it() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+
+    let (argv_json, cwd) = lab.event_replay_metadata(1)?;
+    let argv: Vec<String> = serde_json::from_str(&argv_json.context("argv json")?)?;
+    assert_eq!(argv, vec!["sh", "-c", "echo hello > notes.txt"]);
+    assert_eq!(cwd, ".");
+    assert!(lab.rewind(&["verify"])?.status.success());
+
+    let conn = Connection::open(lab.path().join(".rewind/events.db"))?;
+    conn.execute(
+        "UPDATE events SET command_argv_json = '{bad json' WHERE id = 1",
+        [],
+    )?;
+    assert!(!lab.rewind_raw(&["verify"])?.status.success());
+    conn.execute("UPDATE events SET command_argv_json = NULL, command_cwd_relative = '../outside' WHERE id = 1", [])?;
+    assert!(!lab.rewind_raw(&["verify"])?.status.success());
+    conn.execute(
+        "UPDATE events SET command_cwd_relative = '.rewind' WHERE id = 1",
+        [],
+    )?;
+    assert!(!lab.rewind_raw(&["verify"])?.status.success());
+    Ok(())
+}
+
+#[test]
+fn replay_dry_run_is_default_and_read_only() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let events_before = lab.event_count()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    let default = String::from_utf8(lab.rewind(&["replay", "1"])?.stdout)?;
+    let dry_run = String::from_utf8(lab.rewind(&["replay", "1", "--dry-run"])?.stdout)?;
+
+    assert!(default.contains("Replay plan for event 1"));
+    assert!(dry_run.contains("Replay source: argv"));
+    assert!(dry_run.contains("restore snapshot"));
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert!(!lab.path().join(".rewind/journal/active.json").exists());
+    Ok(())
+}
+
+#[test]
+fn replay_refuses_non_run_events() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("manual.txt"), "manual\n")?;
+    lab.rewind(&["commit", "-m", "manual"])?;
+
+    let output = lab.rewind_raw(&["replay", "1", "--dry-run"])?;
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("only supports run events"));
+    Ok(())
+}
+
+#[test]
+fn replay_sandbox_and_compare_reproduce_simple_events_without_mutating_workspace() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    let head_before = lab.head_snapshot()?;
+    let events_before = lab.event_count()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    let checkpoints_before = lab.checkpoint_count()?;
+
+    let sandbox = String::from_utf8(lab.rewind(&["replay", "1", "--sandbox"])?.stdout)?;
+    assert!(sandbox.contains("exact reproduction: yes"));
+    assert_eq!(fs::read_to_string(lab.path().join("notes.txt"))?, "hello\n");
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert_eq!(lab.checkpoint_count()?, checkpoints_before);
+    assert!(!lab.path().join(".rewind/journal/active.json").exists());
+
+    lab.run(&["sh", "-c", "echo goodbye > notes.txt"])?;
+    let modify = String::from_utf8(lab.rewind(&["replay", "2", "--compare"])?.stdout)?;
+    assert!(modify.contains("exact reproduction: yes"));
+
+    lab.run(&["rm", "notes.txt"])?;
+    let delete = String::from_utf8(lab.rewind(&["replay", "3", "--compare"])?.stdout)?;
+    assert!(delete.contains("exact reproduction: yes"));
+    Ok(())
+}
+
+#[test]
+fn replay_rejects_absolute_argv_without_running_or_mutating_workspace() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo original > notes.txt"])?;
+    lab.set_event_argv(1, &["/bin/sh", "-c", "echo changed > notes.txt"])?;
+    let head_before = lab.head_snapshot()?;
+    let events_before = lab.event_count()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+
+    let output = lab.rewind_raw(&["replay", "1", "--sandbox"])?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("absolute executable path"));
+    assert_eq!(
+        fs::read_to_string(lab.path().join("notes.txt"))?,
+        "original\n"
+    );
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.event_count()?, events_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    assert!(!lab.path().join(".rewind/journal/active.json").exists());
+    Ok(())
+}
+
+#[test]
+fn replay_cleans_sandbox_after_command_spawn_failure() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    lab.set_event_argv(1, &["definitely-not-a-rewind-command"])?;
+    let temp_dirs_before = replay_temp_dirs(1)?;
+    let head_before = lab.head_snapshot()?;
+    let events_before = lab.event_count()?;
+
+    let output = lab.rewind_raw(&["replay", "1", "--sandbox"])?;
+
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("replaying event 1"));
+    assert_eq!(replay_temp_dirs(1)?, temp_dirs_before);
+    assert_eq!(fs::read_to_string(lab.path().join("notes.txt"))?, "hello\n");
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.event_count()?, events_before);
+    Ok(())
+}
+
+#[test]
+fn replay_compare_reports_path_dependent_content_mismatch() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "pwd > where.txt"])?;
+
+    let output = String::from_utf8(lab.rewind(&["replay", "1", "--compare"])?.stdout)?;
+
+    assert!(output.contains("Filesystem match: no"));
+    assert!(output.contains("Content mismatches:"));
+    assert!(output.contains("where.txt"));
+    assert!(output.contains("--- where.txt original"));
+    assert!(output.contains("+++ where.txt replay"));
+    Ok(())
+}
+
+#[test]
+fn replay_keep_preserves_sandbox_artifacts() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+
+    let output = String::from_utf8(lab.rewind(&["replay", "1", "--sandbox", "--keep"])?.stdout)?;
+    let root_line = output
+        .lines()
+        .find(|line| line.trim_start().starts_with("root:"))
+        .context("root line")?;
+    let root = PathBuf::from(
+        root_line
+            .split_once(':')
+            .context("root separator")?
+            .1
+            .trim(),
+    );
+
+    assert!(root.join("workspace/notes.txt").exists());
+    assert!(root.join("stdout.txt").exists());
+    assert!(root.join("stderr.txt").exists());
+    fs::remove_dir_all(root)?;
+    Ok(())
+}
+
+#[test]
+fn replay_legacy_fallback_and_active_journal_warning_work() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+    lab.clear_event_argv(1)?;
+
+    let dry = lab.rewind_raw(&["replay", "1", "--dry-run"])?;
+    if cfg!(unix) {
+        assert!(dry.status.success());
+        let stdout = String::from_utf8_lossy(&dry.stdout);
+        assert!(stdout.contains("legacy-shell-fallback"));
+        assert!(stdout.contains("shell fallback"));
+    } else {
+        assert!(!dry.status.success());
+        assert!(String::from_utf8_lossy(&dry.stderr).contains("no exact argv"));
+    }
+
+    lab.run(&["sh", "-c", "echo goodbye > notes.txt"])?;
+    assert!(!lab
+        .rewind_raw(&["checkout", "--before", "2", "--debug-stop-after-journal"])?
+        .status
+        .success());
+    let output = lab.rewind_raw(&["replay", "2", "--dry-run"])?;
+    assert!(output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("active recovery transaction"));
+    assert!(lab.active_journal_path().exists());
+    Ok(())
+}
+
+#[test]
+fn replay_suggestions_appear_in_show_tui_and_stats() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo hello > notes.txt"])?;
+
+    let show = String::from_utf8(lab.rewind(&["show", "1"])?.stdout)?;
+    assert!(show.contains("Replay:"));
+    assert!(show.contains("rewind replay 1 --dry-run"));
+    assert!(show.contains("rewind replay 1 --compare"));
+    let tui = String::from_utf8(lab.rewind(&["tui", "--once", "--selected", "1"])?.stdout)?;
+    assert!(tui.contains("rewind replay 1 --dry-run"));
+    assert!(tui.contains("rewind replay 1 --compare"));
+    let stats = String::from_utf8(lab.rewind(&["stats"])?.stdout)?;
+    assert!(stats.contains("Replay:"));
+    assert!(stats.contains("exact argv:"));
     Ok(())
 }

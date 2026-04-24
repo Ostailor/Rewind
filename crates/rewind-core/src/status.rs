@@ -1,6 +1,7 @@
+use crate::config;
 use crate::diff::{diff_snapshots, ChangeType, SnapshotDiff};
 use crate::history;
-use crate::snapshot::{load_snapshot, scan_worktree, SnapshotManifest};
+use crate::snapshot::{load_snapshot, scan_worktree_with_ignored, SnapshotManifest};
 use anyhow::{bail, Context, Result};
 use std::path::Path;
 
@@ -8,6 +9,7 @@ use std::path::Path;
 pub struct WorktreeStatus {
     pub head_snapshot: String,
     pub diff: SnapshotDiff,
+    pub ignored_paths: Vec<String>,
 }
 
 impl WorktreeStatus {
@@ -52,10 +54,12 @@ pub fn compare_current_to_head(
     head_snapshot: &str,
     head: &SnapshotManifest,
 ) -> Result<WorktreeStatus> {
-    let current = scan_worktree(project_dir)?;
+    let scan = scan_worktree_with_ignored(project_dir)?;
+    let head = effective_head(project_dir, head)?;
     Ok(WorktreeStatus {
         head_snapshot: head_snapshot.to_owned(),
-        diff: diff_snapshots(head, &current),
+        diff: diff_snapshots(&head, &scan.manifest),
+        ignored_paths: scan.ignored_paths,
     })
 }
 
@@ -87,6 +91,42 @@ pub fn dirty_report(status: &WorktreeStatus) -> String {
         &status.diff.deleted_dirs,
     );
     report
+}
+
+pub fn append_ignored_report(report: &mut String, status: &WorktreeStatus) {
+    append_group(report, "Ignored", &status.ignored_paths);
+}
+
+fn effective_head(project_dir: &Path, head: &SnapshotManifest) -> Result<SnapshotManifest> {
+    let Some(rules) = config::load_ignore_rules(project_dir)? else {
+        return Ok(head.clone());
+    };
+    let directories = head
+        .directories
+        .iter()
+        .filter(|path| !rules.is_ignored(path, true))
+        .cloned()
+        .collect();
+    let files = head
+        .files
+        .iter()
+        .filter(|(path, _)| !rules.is_ignored(path, false))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect();
+    let symlinks = head
+        .symlinks
+        .iter()
+        .filter(|(path, _)| !rules.is_ignored(path, false))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect();
+    Ok(SnapshotManifest {
+        manifest_version: head.manifest_version,
+        id: head.id.clone(),
+        created_at: head.created_at.clone(),
+        directories,
+        files,
+        symlinks,
+    })
 }
 
 fn append_group<T: AsRef<str>>(report: &mut String, title: &str, paths: &[T]) {

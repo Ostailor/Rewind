@@ -206,6 +206,8 @@ pub fn commit_metadata(project_dir: &Path, journal: &RestoreTransaction) -> Resu
                 started_dirty: false,
                 timestamp: &timestamp,
                 command: &journal.planned_event_command,
+                command_argv_json: None,
+                command_cwd_relative: ".",
                 exit_code: 0,
                 before_snapshot: &journal.old_head_snapshot,
                 after_snapshot: &journal.target_snapshot,
@@ -254,8 +256,27 @@ fn archive_active(project_dir: &Path, bucket: &str) -> Result<()> {
         .unwrap_or("unknown");
     let dir = project_dir.join(REWIND_DIR).join("journal").join(bucket);
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
-    let target = dir.join(format!("{id}.json"));
+    let target = dir.join(format!("{}.json", safe_archive_id(id)));
     fs::rename(&active, &target)
         .with_context(|| format!("archiving {} to {}", active.display(), target.display()))?;
     Ok(())
+}
+
+fn safe_archive_id(id: &str) -> String {
+    let sanitized = id
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim_matches('_');
+    if sanitized.is_empty() {
+        "unknown".to_owned()
+    } else {
+        sanitized.to_owned()
+    }
 }

@@ -1,4 +1,4 @@
-use crate::snapshot::{FileEntry, SnapshotManifest};
+use crate::snapshot::{FileEntry, SnapshotManifest, SymlinkEntry};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -24,6 +24,8 @@ pub struct FileChange {
     pub change_type: ChangeType,
     pub before_hash: Option<String>,
     pub after_hash: Option<String>,
+    pub before_kind: Option<String>,
+    pub after_kind: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -37,16 +39,15 @@ pub struct SnapshotDiff {
 }
 
 pub fn diff_snapshots(before: &SnapshotManifest, after: &SnapshotManifest) -> SnapshotDiff {
-    let paths = before
-        .files
-        .keys()
-        .chain(after.files.keys())
+    let paths = entry_paths(before)
+        .into_iter()
+        .chain(entry_paths(after))
         .cloned()
         .collect::<BTreeSet<_>>();
 
     let mut diff = SnapshotDiff::default();
     for path in paths {
-        match (before.files.get(&path), after.files.get(&path)) {
+        match (entry_ref(before, &path), entry_ref(after, &path)) {
             (None, Some(after_entry)) => {
                 diff.created_count += 1;
                 diff.changes
@@ -57,7 +58,7 @@ pub fn diff_snapshots(before: &SnapshotManifest, after: &SnapshotManifest) -> Sn
                 diff.changes
                     .push(change(path, ChangeType::Deleted, Some(before_entry), None));
             }
-            (Some(before_entry), Some(after_entry)) if before_entry.hash != after_entry.hash => {
+            (Some(before_entry), Some(after_entry)) if before_entry != after_entry => {
                 diff.modified_count += 1;
                 diff.changes.push(change(
                     path,
@@ -87,13 +88,60 @@ pub fn diff_snapshots(before: &SnapshotManifest, after: &SnapshotManifest) -> Sn
 fn change(
     path: String,
     change_type: ChangeType,
-    before: Option<&FileEntry>,
-    after: Option<&FileEntry>,
+    before: Option<EntryRef<'_>>,
+    after: Option<EntryRef<'_>>,
 ) -> FileChange {
     FileChange {
         path,
         change_type,
-        before_hash: before.map(|entry| entry.hash.clone()),
-        after_hash: after.map(|entry| entry.hash.clone()),
+        before_hash: before.and_then(|entry| entry.hash()),
+        after_hash: after.and_then(|entry| entry.hash()),
+        before_kind: before.map(|entry| entry.kind().to_owned()),
+        after_kind: after.map(|entry| entry.kind().to_owned()),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EntryRef<'a> {
+    Directory,
+    File(&'a FileEntry),
+    Symlink(&'a SymlinkEntry),
+}
+
+impl EntryRef<'_> {
+    fn kind(self) -> &'static str {
+        match self {
+            Self::Directory => "directory",
+            Self::File(_) => "file",
+            Self::Symlink(_) => "symlink",
+        }
+    }
+
+    fn hash(self) -> Option<String> {
+        match self {
+            Self::File(entry) => Some(entry.hash.clone()),
+            Self::Directory | Self::Symlink(_) => None,
+        }
+    }
+}
+
+fn entry_ref<'a>(snapshot: &'a SnapshotManifest, path: &str) -> Option<EntryRef<'a>> {
+    if let Some(file) = snapshot.files.get(path) {
+        Some(EntryRef::File(file))
+    } else if let Some(symlink) = snapshot.symlinks.get(path) {
+        Some(EntryRef::Symlink(symlink))
+    } else if snapshot.directories.contains(path) {
+        Some(EntryRef::Directory)
+    } else {
+        None
+    }
+}
+
+fn entry_paths(snapshot: &SnapshotManifest) -> BTreeSet<&String> {
+    snapshot
+        .directories
+        .iter()
+        .chain(snapshot.files.keys())
+        .chain(snapshot.symlinks.keys())
+        .collect()
 }

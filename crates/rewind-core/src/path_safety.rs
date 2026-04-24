@@ -54,11 +54,16 @@ pub fn validate_snapshot_paths<'a>(
 
 pub fn ensure_no_symlink_in_path(project_dir: &Path, relative_path: &Path) -> Result<()> {
     let mut current = project_dir.to_path_buf();
-    for component in relative_path.components() {
+    let components = relative_path.components().collect::<Vec<_>>();
+    let last_index = components.len().saturating_sub(1);
+    for (index, component) in components.into_iter().enumerate() {
         let Component::Normal(value) = component else {
             bail!("unsafe restore path: {}", relative_path.display());
         };
         current.push(value);
+        if index == last_index {
+            break;
+        }
         if let Ok(metadata) = std::fs::symlink_metadata(&current) {
             if metadata.file_type().is_symlink() {
                 bail!(

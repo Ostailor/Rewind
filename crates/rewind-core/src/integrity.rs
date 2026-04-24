@@ -1,14 +1,19 @@
 use crate::checkpoint;
+use crate::config;
 use crate::history;
 use crate::object_store::sha256_hex;
 use crate::path_safety::validate_snapshot_paths;
-use crate::snapshot::{compute_snapshot_id, load_snapshot, snapshot_path, SnapshotManifest};
+use crate::repo::{self, RepoStatus};
+use crate::snapshot::{
+    compute_snapshot_id_for_manifest, load_snapshot, snapshot_path, SnapshotManifest,
+};
+use crate::trace::TraceStats;
 use crate::transaction;
 use crate::REWIND_DIR;
 use anyhow::{bail, Context, Result};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use walkdir::WalkDir;
 
 #[derive(Debug, Clone, Default)]
@@ -31,6 +36,16 @@ pub struct StorageStats {
     pub unreferenced_object_bytes: u64,
     pub head_snapshot: String,
     pub active_journal: bool,
+    pub trace_stats: TraceStats,
+    pub repo_format_version: Option<u32>,
+    pub db_schema_version: Option<u32>,
+    pub migration_status: String,
+    pub config_status: String,
+    pub ignore_enabled: bool,
+    pub ignore_rule_count: usize,
+    pub manifest_versions: BTreeMap<u32, usize>,
+    pub symlink_entries: usize,
+    pub executable_file_entries: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -144,13 +159,86 @@ pub fn resolve_snapshot_prefix(project_dir: &Path, prefix: &str) -> Result<Strin
 }
 
 fn build_report(project_dir: &Path) -> Result<IntegrityReport> {
+    let mut report = IntegrityReport::default();
+    let repo_status = repo::inspect(project_dir);
+    report.stats.migration_status = repo_status.status.as_str().to_owned();
+    report.stats.active_journal = repo_status.active_journal;
+    if let Some(manifest) = &repo_status.manifest {
+        report.stats.repo_format_version = Some(manifest.format_version);
+        report.stats.db_schema_version = Some(manifest.db_schema_version);
+        if let Err(error) = repo::validate_manifest_shape(manifest) {
+            report.error(format!("Invalid repo manifest: {error}"));
+        }
+    }
+    if let Some(db_schema_version) = repo_status.db_schema_version {
+        if report.stats.db_schema_version.is_none() {
+            report.stats.db_schema_version = Some(db_schema_version);
+        }
+    }
+    match config::status(project_dir) {
+        Ok(status) => {
+            report.stats.ignore_enabled = status.config.ignore.enabled;
+            report.stats.ignore_rule_count = status.ignore_rule_count;
+            report.stats.config_status = if status.config.ignore.enabled {
+                if status.ignore_file_exists {
+                    "valid".to_owned()
+                } else {
+                    "valid (defaults/no ignore file)".to_owned()
+                }
+            } else {
+                "valid (ignore disabled)".to_owned()
+            };
+        }
+        Err(error) => {
+            report.stats.config_status = "invalid".to_owned();
+            report.error(format!("Invalid config/ignore rules: {error:#}"));
+        }
+    }
+
+    match repo_status.status {
+        RepoStatus::Current => {}
+        RepoStatus::Uninitialized => {
+            bail!(
+                "{} is not initialized; run `rewind init` first",
+                project_dir.display()
+            );
+        }
+        RepoStatus::NeedsMigration => {
+            report.error(format!(
+                "Repo needs migration: {}. Run: rewind migrate",
+                repo_status
+                    .reason
+                    .unwrap_or_else(|| "legacy repo format".to_owned())
+            ));
+            return Ok(report);
+        }
+        RepoStatus::IncompatibleFutureFormat => {
+            report.error(format!(
+                "Repo uses a newer unsupported format: {}",
+                repo_status
+                    .reason
+                    .unwrap_or_else(|| "future format".to_owned())
+            ));
+            return Ok(report);
+        }
+        RepoStatus::Invalid => {
+            report.error(format!(
+                "Repo format metadata is invalid: {}",
+                repo_status
+                    .reason
+                    .unwrap_or_else(|| "unknown error".to_owned())
+            ));
+            return Ok(report);
+        }
+    }
+
     let conn = history::ensure_initialized(project_dir)?;
     let events = history::list_events(&conn)?;
     let checkpoints = read_checkpoints_raw(&conn)?;
+    let trace_ids = read_trace_ids(&conn)?;
     let snapshot_ids = list_snapshot_ids(project_dir)?;
     let object_files = list_object_files(project_dir)?;
 
-    let mut report = IntegrityReport::default();
     report.stats.active_journal = transaction::has_active(project_dir);
     if report.stats.active_journal {
         match transaction::recovery_status(project_dir) {
@@ -166,6 +254,7 @@ fn build_report(project_dir: &Path) -> Result<IntegrityReport> {
     }
     report.stats.event_count = events.len();
     report.stats.checkpoint_count = checkpoints.len();
+    report.stats.trace_stats = crate::trace::trace_stats(&conn)?;
 
     for event in &events {
         *report
@@ -176,7 +265,29 @@ fn build_report(project_dir: &Path) -> Result<IntegrityReport> {
         if event.kind.is_empty() {
             report.error(format!("Event {} has empty kind", event.id));
         }
+        if let Some(argv_json) = &event.command_argv_json {
+            match serde_json::from_str::<serde_json::Value>(argv_json) {
+                Ok(serde_json::Value::Array(values))
+                    if values.iter().all(|value| value.is_string()) => {}
+                Ok(_) => report.error(format!(
+                    "Event {} command_argv_json must be a JSON array of strings",
+                    event.id
+                )),
+                Err(error) => report.error(format!(
+                    "Event {} command_argv_json is invalid JSON: {error}",
+                    event.id
+                )),
+            }
+        }
+        if let Err(error) = crate::replay::validate_replay_cwd(&event.command_cwd_relative) {
+            report.error(format!(
+                "Event {} command_cwd_relative is invalid: {error}",
+                event.id
+            ));
+        }
     }
+
+    verify_trace_metadata(project_dir, &conn, &events, &trace_ids, &mut report)?;
 
     match history::get_head_snapshot(&conn)? {
         Some(head) => {
@@ -264,6 +375,113 @@ fn build_report(project_dir: &Path) -> Result<IntegrityReport> {
     Ok(report)
 }
 
+fn verify_trace_metadata(
+    project_dir: &Path,
+    conn: &rusqlite::Connection,
+    events: &[history::Event],
+    trace_ids: &BTreeSet<i64>,
+    report: &mut IntegrityReport,
+) -> Result<()> {
+    let event_ids = events.iter().map(|event| event.id).collect::<BTreeSet<_>>();
+    let mut stmt = conn.prepare(
+        "SELECT id, event_id, raw_trace_path, status
+         FROM command_traces
+         ORDER BY id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, i64>(0)?,
+            row.get::<_, i64>(1)?,
+            row.get::<_, Option<String>>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (trace_id, event_id, raw_trace_path, status) = row?;
+        if !event_ids.contains(&event_id) {
+            report.error(format!(
+                "Trace {trace_id} references missing event {event_id}"
+            ));
+        }
+        if status.is_empty() {
+            report.error(format!("Trace {trace_id} has empty status"));
+        }
+        if let Some(raw_trace_path) = raw_trace_path {
+            if !is_safe_raw_trace_path(&raw_trace_path) {
+                report.error(format!(
+                    "Trace {trace_id} raw path is outside .rewind/traces: {raw_trace_path}"
+                ));
+            } else if !project_dir.join(&raw_trace_path).exists() {
+                report.error(format!(
+                    "Trace {trace_id} raw trace file is missing: {raw_trace_path}"
+                ));
+            }
+        }
+    }
+
+    verify_trace_child_table(conn, "trace_file_events", trace_ids, report)?;
+    verify_trace_child_table(conn, "trace_processes", trace_ids, report)?;
+    verify_trace_access_kinds(conn, report)?;
+    Ok(())
+}
+
+fn is_safe_raw_trace_path(path: &str) -> bool {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return false;
+    }
+    let components = path.components().collect::<Vec<_>>();
+    if components.len() < 3 {
+        return false;
+    }
+    if components[0] != Component::Normal(REWIND_DIR.as_ref())
+        || components[1] != Component::Normal("traces".as_ref())
+    {
+        return false;
+    }
+    components
+        .iter()
+        .all(|component| matches!(component, Component::Normal(_)))
+}
+
+fn verify_trace_child_table(
+    conn: &rusqlite::Connection,
+    table: &str,
+    trace_ids: &BTreeSet<i64>,
+    report: &mut IntegrityReport,
+) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("SELECT id, trace_id FROM {table} ORDER BY id ASC"))?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?;
+    for row in rows {
+        let (id, trace_id) = row?;
+        if !trace_ids.contains(&trace_id) {
+            report.error(format!(
+                "{table} row {id} references missing trace {trace_id}"
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn verify_trace_access_kinds(
+    conn: &rusqlite::Connection,
+    report: &mut IntegrityReport,
+) -> Result<()> {
+    let mut stmt = conn.prepare("SELECT id, access_kind FROM trace_file_events ORDER BY id ASC")?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
+    })?;
+    for row in rows {
+        let (id, access_kind) = row?;
+        if !crate::trace::valid_access_kind(&access_kind) {
+            report.error(format!(
+                "trace_file_events row {id} has invalid access_kind {access_kind}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_reachable_snapshot(project_dir: &Path, snapshot_id: &str, report: &mut IntegrityReport) {
     let path = snapshot_path(project_dir, snapshot_id);
     if !path.exists() {
@@ -280,6 +498,17 @@ fn verify_reachable_snapshot(project_dir: &Path, snapshot_id: &str, report: &mut
     };
 
     verify_snapshot_manifest(snapshot_id, &snapshot, report);
+    *report
+        .stats
+        .manifest_versions
+        .entry(snapshot.manifest_version)
+        .or_insert(0) += 1;
+    report.stats.symlink_entries += snapshot.symlinks.len();
+    report.stats.executable_file_entries += snapshot
+        .files
+        .values()
+        .filter(|entry| entry.executable)
+        .count();
 
     for (file_path, entry) in &snapshot.files {
         let first_reference = report.stats.reachable_objects.insert(entry.hash.clone());
@@ -337,7 +566,7 @@ fn verify_snapshot_manifest(
         ));
     }
 
-    let computed = compute_snapshot_id(&snapshot.directories, &snapshot.files);
+    let computed = compute_snapshot_id_for_manifest(snapshot);
     if computed != snapshot.id {
         report.error(format!(
             "Snapshot {} content id mismatch: expected {}, computed {}",
@@ -361,11 +590,27 @@ fn verify_snapshot_manifest(
             ));
         }
     }
-    if let Err(error) = validate_snapshot_paths(snapshot.directories.iter(), snapshot.files.keys())
-    {
+    for symlink in snapshot.symlinks.keys() {
+        if let Err(error) = crate::path_safety::validate_relative_path(symlink) {
+            report.error(format!(
+                "Invalid symlink path in snapshot {}: {} ({error})",
+                snapshot.id, symlink
+            ));
+        }
+    }
+    if let Err(error) = validate_snapshot_paths(
+        snapshot.directories.iter(),
+        snapshot.files.keys().chain(snapshot.symlinks.keys()),
+    ) {
         report.error(format!(
             "Snapshot {} has invalid paths: {error}",
             snapshot.id
+        ));
+    }
+    if snapshot.manifest_version == 0 || snapshot.manifest_version > 2 {
+        report.error(format!(
+            "Snapshot {} has unsupported manifest_version {}",
+            snapshot.id, snapshot.manifest_version
         ));
     }
 }
@@ -386,6 +631,13 @@ fn read_checkpoints_raw(conn: &rusqlite::Connection) -> Result<Vec<history::Chec
     })?;
     rows.collect::<rusqlite::Result<Vec<_>>>()
         .context("reading checkpoints")
+}
+
+fn read_trace_ids(conn: &rusqlite::Connection) -> Result<BTreeSet<i64>> {
+    let mut stmt = conn.prepare("SELECT id FROM command_traces ORDER BY id ASC")?;
+    let rows = stmt.query_map([], |row| row.get::<_, i64>(0))?;
+    rows.collect::<rusqlite::Result<BTreeSet<_>>>()
+        .context("reading trace ids")
 }
 
 fn list_snapshot_ids(project_dir: &Path) -> Result<BTreeSet<String>> {

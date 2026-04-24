@@ -11,6 +11,8 @@ pub struct Event {
     pub started_dirty: bool,
     pub timestamp: String,
     pub command: String,
+    pub command_argv_json: Option<String>,
+    pub command_cwd_relative: String,
     pub exit_code: i32,
     pub before_snapshot: String,
     pub after_snapshot: String,
@@ -26,6 +28,8 @@ pub struct NewEvent<'a> {
     pub started_dirty: bool,
     pub timestamp: &'a str,
     pub command: &'a str,
+    pub command_argv_json: Option<&'a str>,
+    pub command_cwd_relative: &'a str,
     pub exit_code: i32,
     pub before_snapshot: &'a str,
     pub after_snapshot: &'a str,
@@ -45,7 +49,8 @@ pub fn open(project_dir: &Path) -> Result<Connection> {
     let db_path = project_dir.join(REWIND_DIR).join("events.db");
     let conn =
         Connection::open(&db_path).with_context(|| format!("opening {}", db_path.display()))?;
-    migrate(&conn)?;
+    conn.execute_batch("PRAGMA foreign_keys = ON;")
+        .context("enabling sqlite foreign keys")?;
     Ok(conn)
 }
 
@@ -63,14 +68,17 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
     let tx = conn.transaction().context("starting history transaction")?;
     tx.execute(
         "INSERT INTO events (
-            kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+            kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+            exit_code, before_snapshot, after_snapshot,
             created_count, modified_count, deleted_count, transaction_id
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         params![
             event.kind,
             if event.started_dirty { 1 } else { 0 },
             event.timestamp,
             event.command,
+            event.command_argv_json,
+            event.command_cwd_relative,
             event.exit_code,
             event.before_snapshot,
             event.after_snapshot,
@@ -106,7 +114,8 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
 pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+            "SELECT id, kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+                    exit_code, before_snapshot, after_snapshot,
                     transaction_id, created_count, modified_count, deleted_count, undone
              FROM events
              ORDER BY id ASC",
@@ -121,7 +130,8 @@ pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
 
 pub fn get_event(conn: &Connection, event_id: i64) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+                exit_code, before_snapshot, after_snapshot,
                 transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE id = ?1",
@@ -154,6 +164,8 @@ pub fn list_changes(conn: &Connection, event_id: i64) -> Result<Vec<FileChange>>
                 },
                 before_hash: row.get(2)?,
                 after_hash: row.get(3)?,
+                before_kind: None,
+                after_kind: None,
             })
         })
         .context("querying file changes")?;
@@ -164,7 +176,8 @@ pub fn list_changes(conn: &Connection, event_id: i64) -> Result<Vec<FileChange>>
 
 pub fn latest_non_undone_event(conn: &Connection) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+                exit_code, before_snapshot, after_snapshot,
                 transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0
@@ -182,7 +195,8 @@ pub fn latest_non_undone_event_for_head(
     head_snapshot: &str,
 ) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+                exit_code, before_snapshot, after_snapshot,
                 transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0 AND after_snapshot = ?1
@@ -233,7 +247,7 @@ pub fn get_head_snapshot(conn: &Connection) -> Result<Option<String>> {
     get_workspace_state(conn, "head_snapshot")
 }
 
-fn migrate(conn: &Connection) -> Result<()> {
+pub fn initialize_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "PRAGMA foreign_keys = ON;
          CREATE TABLE IF NOT EXISTS events (
@@ -242,6 +256,8 @@ fn migrate(conn: &Connection) -> Result<()> {
              started_dirty INTEGER NOT NULL DEFAULT 0,
              timestamp TEXT NOT NULL,
              command TEXT NOT NULL,
+             command_argv_json TEXT NULL,
+             command_cwd_relative TEXT NOT NULL DEFAULT '.',
              exit_code INTEGER NOT NULL,
              before_snapshot TEXT NOT NULL,
              after_snapshot TEXT NOT NULL,
@@ -269,12 +285,50 @@ fn migrate(conn: &Connection) -> Result<()> {
              snapshot_id TEXT NOT NULL,
              message TEXT NOT NULL,
              created_at TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS command_traces (
+             id INTEGER PRIMARY KEY,
+             event_id INTEGER NOT NULL,
+             tracer TEXT NOT NULL,
+             status TEXT NOT NULL,
+             started_at TEXT NOT NULL,
+             ended_at TEXT NULL,
+             raw_trace_path TEXT NULL,
+             outside_workspace_ops INTEGER NOT NULL DEFAULT 0,
+             parse_error TEXT NULL
+         );
+         CREATE TABLE IF NOT EXISTS trace_processes (
+             id INTEGER PRIMARY KEY,
+             trace_id INTEGER NOT NULL,
+             pid INTEGER NULL,
+             parent_pid INTEGER NULL,
+             operation TEXT NOT NULL,
+             executable TEXT NULL,
+             timestamp TEXT NULL,
+             result TEXT NULL
+         );
+         CREATE TABLE IF NOT EXISTS trace_file_events (
+             id INTEGER PRIMARY KEY,
+             trace_id INTEGER NOT NULL,
+             seq INTEGER NOT NULL,
+             timestamp TEXT NULL,
+             pid INTEGER NULL,
+             operation TEXT NOT NULL,
+             path TEXT NULL,
+             path2 TEXT NULL,
+             within_workspace INTEGER NOT NULL,
+             result TEXT NULL,
+             errno TEXT NULL,
+             access_kind TEXT NOT NULL DEFAULT 'unknown'
          );",
     )
-    .context("migrating events database")?;
+    .context("initializing events database schema")?;
     ensure_events_kind_column(conn)?;
     ensure_events_started_dirty_column(conn)?;
     ensure_events_transaction_id_column(conn)?;
+    ensure_events_command_argv_json_column(conn)?;
+    ensure_events_command_cwd_relative_column(conn)?;
+    ensure_trace_file_access_kind_column(conn)?;
     Ok(())
 }
 
@@ -314,9 +368,39 @@ fn ensure_events_transaction_id_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_events_command_argv_json_column(conn: &Connection) -> Result<()> {
+    let columns = event_columns(conn)?;
+    if !columns.iter().any(|column| column == "command_argv_json") {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN command_argv_json TEXT NULL",
+            [],
+        )
+        .context("adding events.command_argv_json column")?;
+    }
+
+    Ok(())
+}
+
+fn ensure_events_command_cwd_relative_column(conn: &Connection) -> Result<()> {
+    let columns = event_columns(conn)?;
+    if !columns
+        .iter()
+        .any(|column| column == "command_cwd_relative")
+    {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN command_cwd_relative TEXT NOT NULL DEFAULT '.'",
+            [],
+        )
+        .context("adding events.command_cwd_relative column")?;
+    }
+
+    Ok(())
+}
+
 pub fn event_for_transaction(conn: &Connection, transaction_id: &str) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, command_argv_json, command_cwd_relative,
+                exit_code, before_snapshot, after_snapshot,
                 transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE transaction_id = ?1
@@ -340,22 +424,42 @@ fn event_columns(conn: &Connection) -> Result<Vec<String>> {
     Ok(columns)
 }
 
+fn ensure_trace_file_access_kind_column(conn: &Connection) -> Result<()> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(trace_file_events)")
+        .context("checking trace_file_events columns")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading trace_file_events columns")?;
+    if !columns.iter().any(|column| column == "access_kind") {
+        conn.execute(
+            "ALTER TABLE trace_file_events ADD COLUMN access_kind TEXT NOT NULL DEFAULT 'unknown'",
+            [],
+        )
+        .context("adding trace_file_events.access_kind column")?;
+    }
+    Ok(())
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let started_dirty: i64 = row.get(2)?;
-    let undone: i64 = row.get(12)?;
+    let undone: i64 = row.get(14)?;
     Ok(Event {
         id: row.get(0)?,
         kind: row.get(1)?,
         started_dirty: started_dirty != 0,
         timestamp: row.get(3)?,
         command: row.get(4)?,
-        exit_code: row.get(5)?,
-        before_snapshot: row.get(6)?,
-        after_snapshot: row.get(7)?,
-        transaction_id: row.get(8)?,
-        created_count: row.get(9)?,
-        modified_count: row.get(10)?,
-        deleted_count: row.get(11)?,
+        command_argv_json: row.get(5)?,
+        command_cwd_relative: row.get(6)?,
+        exit_code: row.get(7)?,
+        before_snapshot: row.get(8)?,
+        after_snapshot: row.get(9)?,
+        transaction_id: row.get(10)?,
+        created_count: row.get(11)?,
+        modified_count: row.get(12)?,
+        deleted_count: row.get(13)?,
         undone: undone != 0,
     })
 }

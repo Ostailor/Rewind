@@ -140,6 +140,9 @@ pub fn cat_file(project_dir: &Path, path: &str, target: CatTarget) -> Result<Cat
     if snapshot.directories.contains(&path) {
         bail!("Path is a directory in that snapshot.");
     }
+    if let Some(symlink) = snapshot.symlinks.get(&path) {
+        bail!("Path is a symlink in that snapshot: {}", symlink.target);
+    }
     let entry = snapshot
         .files
         .get(&path)
@@ -169,12 +172,20 @@ pub fn deleted_files(
                 historical_paths.insert(path.clone());
             }
         }
+        for path in snapshot.symlinks.keys() {
+            if filter
+                .as_ref()
+                .is_none_or(|filter| matches_path(filter, path))
+            {
+                historical_paths.insert(path.clone());
+            }
+        }
     }
 
     let deletion_events = deletion_events(project_dir)?;
     let mut entries = Vec::new();
     for path in historical_paths {
-        if head.files.contains_key(&path) {
+        if head.files.contains_key(&path) || head.symlinks.contains_key(&path) {
             continue;
         }
         let deleted_by_event_id = deletion_events.get(&path).copied();
