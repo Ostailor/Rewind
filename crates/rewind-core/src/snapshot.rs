@@ -71,7 +71,7 @@ fn scan_project(project_dir: &Path, mode: ScanMode) -> Result<SnapshotManifest> 
     }
 
     let created_at = Utc::now().to_rfc3339();
-    let id = snapshot_id(&directories, &files);
+    let id = compute_snapshot_id(&directories, &files);
     Ok(SnapshotManifest {
         id,
         created_at,
@@ -138,7 +138,10 @@ fn relative_path(project_dir: &Path, path: &Path) -> Result<String> {
     Ok(relative.to_string_lossy().replace('\\', "/"))
 }
 
-fn snapshot_id(directories: &BTreeSet<String>, files: &BTreeMap<String, FileEntry>) -> String {
+pub fn compute_snapshot_id(
+    directories: &BTreeSet<String>,
+    files: &BTreeMap<String, FileEntry>,
+) -> String {
     let mut hasher = Sha256::new();
     for directory in directories {
         hasher.update(b"dir\0");

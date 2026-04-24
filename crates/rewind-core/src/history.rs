@@ -14,6 +14,7 @@ pub struct Event {
     pub exit_code: i32,
     pub before_snapshot: String,
     pub after_snapshot: String,
+    pub transaction_id: Option<String>,
     pub created_count: i64,
     pub modified_count: i64,
     pub deleted_count: i64,
@@ -29,6 +30,15 @@ pub struct NewEvent<'a> {
     pub before_snapshot: &'a str,
     pub after_snapshot: &'a str,
     pub diff: &'a SnapshotDiff,
+    pub transaction_id: Option<&'a str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct Checkpoint {
+    pub name: String,
+    pub snapshot_id: String,
+    pub message: String,
+    pub created_at: String,
 }
 
 pub fn open(project_dir: &Path) -> Result<Connection> {
@@ -54,8 +64,8 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
     tx.execute(
         "INSERT INTO events (
             kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
-            created_count, modified_count, deleted_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            created_count, modified_count, deleted_count, transaction_id
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
         params![
             event.kind,
             if event.started_dirty { 1 } else { 0 },
@@ -67,6 +77,7 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
             event.diff.created_count as i64,
             event.diff.modified_count as i64,
             event.diff.deleted_count as i64,
+            event.transaction_id,
         ],
     )
     .context("inserting event")?;
@@ -96,7 +107,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn
         .prepare(
             "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
-                    created_count, modified_count, deleted_count, undone
+                    transaction_id, created_count, modified_count, deleted_count, undone
              FROM events
              ORDER BY id ASC",
         )
@@ -111,7 +122,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
 pub fn get_event(conn: &Connection, event_id: i64) -> Result<Option<Event>> {
     conn.query_row(
         "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
-                created_count, modified_count, deleted_count, undone
+                transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE id = ?1",
         params![event_id],
@@ -154,7 +165,7 @@ pub fn list_changes(conn: &Connection, event_id: i64) -> Result<Vec<FileChange>>
 pub fn latest_non_undone_event(conn: &Connection) -> Result<Option<Event>> {
     conn.query_row(
         "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
-                created_count, modified_count, deleted_count, undone
+                transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0
          ORDER BY id DESC
@@ -172,7 +183,7 @@ pub fn latest_non_undone_event_for_head(
 ) -> Result<Option<Event>> {
     conn.query_row(
         "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
-                created_count, modified_count, deleted_count, undone
+                transaction_id, created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0 AND after_snapshot = ?1
          ORDER BY id DESC
@@ -234,6 +245,7 @@ fn migrate(conn: &Connection) -> Result<()> {
              exit_code INTEGER NOT NULL,
              before_snapshot TEXT NOT NULL,
              after_snapshot TEXT NOT NULL,
+             transaction_id TEXT NULL,
              created_count INTEGER NOT NULL,
              modified_count INTEGER NOT NULL,
              deleted_count INTEGER NOT NULL,
@@ -251,11 +263,18 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS workspace_state (
              key TEXT PRIMARY KEY,
              value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS checkpoints (
+             name TEXT PRIMARY KEY,
+             snapshot_id TEXT NOT NULL,
+             message TEXT NOT NULL,
+             created_at TEXT NOT NULL
          );",
     )
     .context("migrating events database")?;
     ensure_events_kind_column(conn)?;
     ensure_events_started_dirty_column(conn)?;
+    ensure_events_transaction_id_column(conn)?;
     Ok(())
 }
 
@@ -285,6 +304,31 @@ fn ensure_events_started_dirty_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_events_transaction_id_column(conn: &Connection) -> Result<()> {
+    let columns = event_columns(conn)?;
+    if !columns.iter().any(|column| column == "transaction_id") {
+        conn.execute("ALTER TABLE events ADD COLUMN transaction_id TEXT NULL", [])
+            .context("adding events.transaction_id column")?;
+    }
+
+    Ok(())
+}
+
+pub fn event_for_transaction(conn: &Connection, transaction_id: &str) -> Result<Option<Event>> {
+    conn.query_row(
+        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
+                transaction_id, created_count, modified_count, deleted_count, undone
+         FROM events
+         WHERE transaction_id = ?1
+         ORDER BY id ASC
+         LIMIT 1",
+        params![transaction_id],
+        event_from_row,
+    )
+    .optional()
+    .context("querying event for transaction")
+}
+
 fn event_columns(conn: &Connection) -> Result<Vec<String>> {
     let mut stmt = conn
         .prepare("PRAGMA table_info(events)")
@@ -298,7 +342,7 @@ fn event_columns(conn: &Connection) -> Result<Vec<String>> {
 
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
     let started_dirty: i64 = row.get(2)?;
-    let undone: i64 = row.get(11)?;
+    let undone: i64 = row.get(12)?;
     Ok(Event {
         id: row.get(0)?,
         kind: row.get(1)?,
@@ -308,9 +352,10 @@ fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
         exit_code: row.get(5)?,
         before_snapshot: row.get(6)?,
         after_snapshot: row.get(7)?,
-        created_count: row.get(8)?,
-        modified_count: row.get(9)?,
-        deleted_count: row.get(10)?,
+        transaction_id: row.get(8)?,
+        created_count: row.get(9)?,
+        modified_count: row.get(10)?,
+        deleted_count: row.get(11)?,
         undone: undone != 0,
     })
 }

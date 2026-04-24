@@ -2,6 +2,7 @@ use crate::diff::diff_snapshots;
 use crate::history;
 use crate::snapshot::{create_snapshot, load_snapshot, write_snapshot};
 use crate::status::{compare_current_to_head, WorktreeStatus};
+use crate::transaction;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
 use std::path::Path;
@@ -23,6 +24,7 @@ pub fn run_command(
     }
 
     let conn = history::ensure_initialized(project_dir)?;
+    transaction::ensure_no_active(project_dir)?;
     let head_snapshot = history::get_head_snapshot(&conn)?
         .context("workspace has no head snapshot; run `rewind init` again")?;
     let head = load_snapshot(project_dir, &head_snapshot)?;
@@ -62,6 +64,7 @@ pub fn run_command(
             before_snapshot: &before.id,
             after_snapshot: &after.id,
             diff: &diff,
+            transaction_id: None,
         },
     )?;
     history::set_head_snapshot(&conn, &after.id)?;

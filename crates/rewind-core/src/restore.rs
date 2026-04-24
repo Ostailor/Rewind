@@ -3,17 +3,19 @@ use crate::object_store::ObjectStore;
 use crate::path_safety::{
     ensure_no_symlink_in_path, validate_relative_path, validate_snapshot_paths,
 };
-use crate::snapshot::{create_snapshot, write_snapshot};
-use crate::snapshot::{load_snapshot, SnapshotManifest};
+use crate::snapshot::{compute_snapshot_id, write_snapshot};
+use crate::snapshot::{load_snapshot, FileEntry, SnapshotManifest};
 use crate::status::{compare_current_to_head, WorktreeStatus};
+use crate::transaction::{self, DebugStop, RestoreTransaction, TransactionPhase};
 use crate::REWIND_DIR;
 use anyhow::{bail, Context, Result};
 use chrono::Utc;
-use std::collections::BTreeSet;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RestorePlan {
     pub create_dirs: Vec<PathBuf>,
     pub remove_dirs: Vec<PathBuf>,
@@ -53,7 +55,16 @@ pub enum TargetedRestoreOutcome {
 }
 
 pub fn undo_latest(project_dir: &Path, dry_run: bool) -> Result<UndoOutcome> {
+    undo_latest_with_debug(project_dir, dry_run, DebugStop::None)
+}
+
+pub fn undo_latest_with_debug(
+    project_dir: &Path,
+    dry_run: bool,
+    debug_stop: DebugStop,
+) -> Result<UndoOutcome> {
     let conn = history::ensure_initialized(project_dir)?;
+    transaction::ensure_no_active(project_dir)?;
     let Some(head_snapshot) = history::get_head_snapshot(&conn)? else {
         return Ok(UndoOutcome::NothingToUndo);
     };
@@ -79,9 +90,36 @@ pub fn undo_latest(project_dir: &Path, dry_run: bool) -> Result<UndoOutcome> {
         });
     }
 
+    let mut journal = RestoreTransaction::new(
+        "undo",
+        "undo",
+        &head_snapshot,
+        &event.before_snapshot,
+        "undo",
+        "undo",
+        plan.clone(),
+    );
+    journal.undo_event_id = Some(event.id);
+    transaction::write_active(project_dir, &journal)?;
+    if debug_stop == DebugStop::AfterJournal {
+        bail!("debug stop after journal");
+    }
+    journal.phase = TransactionPhase::Applying;
+    transaction::write_active(project_dir, &journal)?;
     apply_restore_plan(project_dir, &target, &plan)?;
+    if debug_stop == DebugStop::AfterApply {
+        bail!("debug stop after apply");
+    }
+    journal.phase = TransactionPhase::Committing;
+    transaction::write_active(project_dir, &journal)?;
     history::mark_undone(&conn, event.id)?;
     history::set_head_snapshot(&conn, &event.before_snapshot)?;
+    journal.phase = TransactionPhase::Committed;
+    transaction::write_active(project_dir, &journal)?;
+    if debug_stop == DebugStop::AfterCommit {
+        bail!("debug stop after commit");
+    }
+    transaction::archive_completed(project_dir)?;
     Ok(UndoOutcome::Applied { event_id: event.id })
 }
 
@@ -133,7 +171,7 @@ pub fn build_restore_plan(
     })
 }
 
-fn validate_restore_plan(project_dir: &Path, plan: &RestorePlan) -> Result<()> {
+pub fn validate_restore_plan(project_dir: &Path, plan: &RestorePlan) -> Result<()> {
     for path in plan
         .create_dirs
         .iter()
@@ -154,8 +192,27 @@ pub fn targeted_restore(
     event_id: i64,
     dry_run: bool,
 ) -> Result<TargetedRestoreOutcome> {
+    targeted_restore_with_debug(
+        project_dir,
+        path,
+        source,
+        event_id,
+        dry_run,
+        DebugStop::None,
+    )
+}
+
+pub fn targeted_restore_with_debug(
+    project_dir: &Path,
+    path: &str,
+    source: RestoreSource,
+    event_id: i64,
+    dry_run: bool,
+    debug_stop: DebugStop,
+) -> Result<TargetedRestoreOutcome> {
     let path = validate_relative_path(path)?;
     let conn = history::ensure_initialized(project_dir)?;
+    transaction::ensure_no_active(project_dir)?;
     let Some(head_snapshot) = history::get_head_snapshot(&conn)? else {
         return Ok(TargetedRestoreOutcome::NothingToRestore);
     };
@@ -183,8 +240,7 @@ pub fn targeted_restore(
         return Ok(TargetedRestoreOutcome::DryRun { plan });
     }
 
-    apply_restore_plan(project_dir, &source_snapshot, &plan)?;
-    let after = create_snapshot(project_dir)?;
+    let after = build_path_restored_snapshot(&head, &source_snapshot, &path);
     write_snapshot(project_dir, &after)?;
     let diff = crate::diff::diff_snapshots(&head, &after);
     let command = format!(
@@ -193,6 +249,27 @@ pub fn targeted_restore(
         source.as_str(),
         event_id
     );
+    let mut journal = RestoreTransaction::new(
+        "restore",
+        &command,
+        &head_snapshot,
+        &after.id,
+        "restore",
+        &command,
+        plan.clone(),
+    );
+    transaction::write_active(project_dir, &journal)?;
+    if debug_stop == DebugStop::AfterJournal {
+        bail!("debug stop after journal");
+    }
+    journal.phase = TransactionPhase::Applying;
+    transaction::write_active(project_dir, &journal)?;
+    apply_restore_plan(project_dir, &after, &plan)?;
+    if debug_stop == DebugStop::AfterApply {
+        bail!("debug stop after apply");
+    }
+    journal.phase = TransactionPhase::Committing;
+    transaction::write_active(project_dir, &journal)?;
     let mut conn = conn;
     let timestamp = Utc::now().to_rfc3339();
     let restore_event_id = history::insert_event(
@@ -206,13 +283,74 @@ pub fn targeted_restore(
             before_snapshot: &head_snapshot,
             after_snapshot: &after.id,
             diff: &diff,
+            transaction_id: Some(&journal.id),
         },
     )?;
     history::set_head_snapshot(&conn, &after.id)?;
+    journal.phase = TransactionPhase::Committed;
+    transaction::write_active(project_dir, &journal)?;
+    if debug_stop == DebugStop::AfterCommit {
+        bail!("debug stop after commit");
+    }
+    transaction::archive_completed(project_dir)?;
     Ok(TargetedRestoreOutcome::Applied {
         event_id: restore_event_id,
         plan,
     })
+}
+
+pub fn build_path_restored_snapshot(
+    current: &SnapshotManifest,
+    source: &SnapshotManifest,
+    path: &Path,
+) -> SnapshotManifest {
+    let path_string = path.to_string_lossy().replace('\\', "/");
+    let mut directories = remove_subtree_dirs(&current.directories, &path_string);
+    let mut files = remove_subtree_files(&current.files, &path_string);
+
+    if source.directories.contains(&path_string) {
+        directories.insert(path_string.clone());
+    }
+    for directory in &source.directories {
+        if is_descendant(&path_string, directory) {
+            directories.insert(directory.clone());
+        }
+    }
+    if let Some(file) = source.files.get(&path_string) {
+        files.insert(path_string.clone(), file.clone());
+    }
+    for (file_path, file) in &source.files {
+        if is_descendant(&path_string, file_path) {
+            files.insert(file_path.clone(), file.clone());
+        }
+    }
+
+    let id = compute_snapshot_id(&directories, &files);
+    SnapshotManifest {
+        id,
+        created_at: Utc::now().to_rfc3339(),
+        directories,
+        files,
+    }
+}
+
+fn remove_subtree_dirs(directories: &BTreeSet<String>, root: &str) -> BTreeSet<String> {
+    directories
+        .iter()
+        .filter(|path| path.as_str() != root && !is_descendant(root, path))
+        .cloned()
+        .collect()
+}
+
+fn remove_subtree_files(
+    files: &BTreeMap<String, FileEntry>,
+    root: &str,
+) -> BTreeMap<String, FileEntry> {
+    files
+        .iter()
+        .filter(|(path, _)| path.as_str() != root && !is_descendant(root, path))
+        .map(|(path, entry)| (path.clone(), entry.clone()))
+        .collect()
 }
 
 pub fn build_path_restore_plan(
