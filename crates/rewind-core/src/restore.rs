@@ -199,6 +199,7 @@ pub fn targeted_restore(
         &mut conn,
         history::NewEvent {
             kind: "restore",
+            started_dirty: false,
             timestamp: &timestamp,
             command: &command,
             exit_code: 0,

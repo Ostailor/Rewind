@@ -66,6 +66,13 @@ impl Lab {
         Ok(())
     }
 
+    fn run_allow_dirty(&self, command: &[&str]) -> Result<()> {
+        let mut args = vec!["run", "--allow-dirty", "--"];
+        args.extend(command);
+        self.rewind(&args)?;
+        Ok(())
+    }
+
     fn event_count(&self) -> Result<i64> {
         let conn = Connection::open(self.path().join(".rewind/events.db"))?;
         Ok(conn.query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?)
@@ -124,6 +131,33 @@ impl Lab {
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?)
     }
+
+    fn latest_event_started_dirty(&self) -> Result<bool> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        let started_dirty: i64 = conn.query_row(
+            "SELECT started_dirty FROM events ORDER BY id DESC LIMIT 1",
+            [],
+            |row| row.get(0),
+        )?;
+        Ok(started_dirty != 0)
+    }
+
+    fn file_change_count(&self, event_id: i64, change_type: &str) -> Result<i64> {
+        let conn = Connection::open(self.path().join(".rewind/events.db"))?;
+        Ok(conn.query_row(
+            "SELECT COUNT(*) FROM file_changes WHERE event_id = ?1 AND change_type = ?2",
+            (event_id, change_type),
+            |row| row.get(0),
+        )?)
+    }
+
+    fn snapshot_manifest_count(&self) -> Result<usize> {
+        Ok(fs::read_dir(self.path().join(".rewind/snapshots"))?.count())
+    }
+
+    fn object_count(&self) -> Result<usize> {
+        Ok(fs::read_dir(self.path().join(".rewind/objects"))?.count())
+    }
 }
 
 #[test]
@@ -154,8 +188,8 @@ fn creating_a_file_through_run_is_recorded() -> Result<()> {
 #[test]
 fn modifying_a_file_through_run_is_recorded() -> Result<()> {
     let lab = Lab::new();
-    lab.init()?;
     fs::write(lab.path().join("notes.txt"), "hello\n")?;
+    lab.init()?;
 
     lab.run(&["sh", "-c", "echo goodbye > notes.txt"])?;
 
@@ -170,8 +204,8 @@ fn modifying_a_file_through_run_is_recorded() -> Result<()> {
 #[test]
 fn deleting_a_file_through_run_is_recorded() -> Result<()> {
     let lab = Lab::new();
-    lab.init()?;
     fs::write(lab.path().join("notes.txt"), "hello\n")?;
+    lab.init()?;
 
     lab.run(&["rm", "notes.txt"])?;
 
@@ -195,8 +229,8 @@ fn undo_reverses_a_file_creation() -> Result<()> {
 #[test]
 fn undo_reverses_a_file_modification() -> Result<()> {
     let lab = Lab::new();
-    lab.init()?;
     fs::write(lab.path().join("notes.txt"), "hello\n")?;
+    lab.init()?;
     lab.run(&["sh", "-c", "echo goodbye > notes.txt"])?;
 
     lab.rewind(&["undo"])?;
@@ -208,8 +242,8 @@ fn undo_reverses_a_file_modification() -> Result<()> {
 #[test]
 fn undo_reverses_a_file_deletion() -> Result<()> {
     let lab = Lab::new();
-    lab.init()?;
     fs::write(lab.path().join("notes.txt"), "hello\n")?;
+    lab.init()?;
     lab.run(&["rm", "notes.txt"])?;
 
     lab.rewind(&["undo"])?;
@@ -789,5 +823,246 @@ fn rewind_directory_never_appears_in_timeline_diff_restore_plan_or_status() -> R
     assert!(!diff.contains(".rewind"));
     assert!(!plan.contains(".rewind"));
     assert!(!status.contains(".rewind"));
+    Ok(())
+}
+
+#[test]
+fn run_refuses_when_untracked_file_was_manually_added() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    let output = lab.rewind_raw(&["run", "--", "sh", "-c", "echo later > other.txt"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("Cannot run command: Rewind worktree is dirty."));
+    assert!(stdout.contains("scratch.txt"));
+    assert!(!lab.path().join("other.txt").exists());
+    assert_eq!(lab.event_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn run_refuses_when_tracked_file_was_manually_modified() -> Result<()> {
+    let lab = Lab::new();
+    fs::write(lab.path().join("notes.txt"), "original\n")?;
+    lab.init()?;
+    fs::write(lab.path().join("notes.txt"), "manual\n")?;
+
+    let output = lab.rewind_raw(&["run", "--", "sh", "-c", "echo later > other.txt"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("Modified:"));
+    assert!(stdout.contains("notes.txt"));
+    assert!(!lab.path().join("other.txt").exists());
+    assert_eq!(lab.event_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn run_refuses_when_tracked_file_was_manually_deleted() -> Result<()> {
+    let lab = Lab::new();
+    fs::write(lab.path().join("notes.txt"), "original\n")?;
+    lab.init()?;
+    fs::remove_file(lab.path().join("notes.txt"))?;
+
+    let output = lab.rewind_raw(&["run", "--", "sh", "-c", "echo later > other.txt"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(!output.status.success());
+    assert!(stdout.contains("Deleted:"));
+    assert!(stdout.contains("notes.txt"));
+    assert!(!lab.path().join("other.txt").exists());
+    assert_eq!(lab.event_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn run_dirty_refusal_suggests_commit_command() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    let output = lab.rewind_raw(&["run", "--", "sh", "-c", "echo later > other.txt"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(stdout.contains("rewind commit -m \"describe your changes\""));
+    assert!(stdout.contains("Or discard/restore them manually, then try again."));
+    Ok(())
+}
+
+#[test]
+fn run_allow_dirty_allows_running_from_dirty_worktree_and_marks_event() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    lab.run_allow_dirty(&["sh", "-c", "echo later > other.txt"])?;
+
+    assert_eq!(fs::read_to_string(lab.path().join("other.txt"))?, "later\n");
+    assert_eq!(lab.event_count()?, 1);
+    assert!(lab.latest_event_started_dirty()?);
+    Ok(())
+}
+
+#[test]
+fn show_displays_dirty_start_information() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+    lab.run_allow_dirty(&["sh", "-c", "echo later > other.txt"])?;
+
+    let output = lab.rewind(&["show", "1"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(stdout.contains("Started from dirty worktree: yes"));
+    Ok(())
+}
+
+#[test]
+fn commit_records_added_files_and_updates_head() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let head_before = lab.head_snapshot()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    lab.rewind(&["commit", "-m", "add scratch"])?;
+
+    assert_ne!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.event_count()?, 1);
+    assert_eq!(lab.file_change_count(1, "created")?, 1);
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    assert!(status.contains("Rewind worktree clean."));
+    Ok(())
+}
+
+#[test]
+fn commit_records_modified_files() -> Result<()> {
+    let lab = Lab::new();
+    fs::write(lab.path().join("notes.txt"), "original\n")?;
+    lab.init()?;
+    fs::write(lab.path().join("notes.txt"), "manual\n")?;
+
+    lab.rewind(&["commit", "-m", "manual edit"])?;
+
+    assert_eq!(lab.file_change_count(1, "modified")?, 1);
+    Ok(())
+}
+
+#[test]
+fn commit_records_deleted_files() -> Result<()> {
+    let lab = Lab::new();
+    fs::write(lab.path().join("notes.txt"), "original\n")?;
+    lab.init()?;
+    fs::remove_file(lab.path().join("notes.txt"))?;
+
+    lab.rewind(&["commit", "-m", "manual delete"])?;
+
+    assert_eq!(lab.file_change_count(1, "deleted")?, 1);
+    Ok(())
+}
+
+#[test]
+fn commit_creates_commit_event_kind_and_file_changes() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    lab.rewind(&["commit", "-m", "manual capture"])?;
+    let (kind, command) = lab.latest_event_kind_and_command()?;
+
+    assert_eq!(kind, "commit");
+    assert!(command.contains("commit: manual capture"));
+    assert_eq!(lab.file_change_count(1, "created")?, 1);
+    assert!(!lab.latest_event_started_dirty()?);
+    Ok(())
+}
+
+#[test]
+fn commit_dry_run_does_not_create_event_update_head_or_write_storage() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    let head_before = lab.head_snapshot()?;
+    let snapshots_before = lab.snapshot_manifest_count()?;
+    let objects_before = lab.object_count()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+
+    let output = lab.rewind(&["commit", "--dry-run", "-m", "manual capture"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(stdout.contains("Would commit manual changes: manual capture"));
+    assert!(stdout.contains("Added:"));
+    assert!(stdout.contains("scratch.txt"));
+    assert_eq!(lab.event_count()?, 0);
+    assert_eq!(lab.head_snapshot()?, head_before);
+    assert_eq!(lab.snapshot_manifest_count()?, snapshots_before);
+    assert_eq!(lab.object_count()?, objects_before);
+    Ok(())
+}
+
+#[test]
+fn commit_on_clean_worktree_creates_no_event() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+
+    let output = lab.rewind(&["commit", "-m", "nothing"])?;
+    let stdout = String::from_utf8(output.stdout)?;
+
+    assert!(stdout.contains("Nothing to commit. Rewind worktree clean."));
+    assert_eq!(lab.event_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn undo_can_undo_commit_event_and_restore_head_snapshot() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    lab.run(&["sh", "-c", "echo original > notes.txt"])?;
+    let head_before_commit = lab.head_snapshot()?;
+    fs::write(lab.path().join("notes.txt"), "manual\n")?;
+    lab.rewind(&["commit", "-m", "manual edit"])?;
+
+    lab.rewind(&["undo"])?;
+
+    assert_eq!(
+        fs::read_to_string(lab.path().join("notes.txt"))?,
+        "original\n"
+    );
+    assert_eq!(lab.head_snapshot()?, head_before_commit);
+    assert_eq!(lab.undone_count()?, 1);
+    Ok(())
+}
+
+#[test]
+fn rewind_directory_changes_are_ignored_by_status_and_commit() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join(".rewind/internal.txt"), "ignore me")?;
+
+    let status = String::from_utf8(lab.rewind(&["status"])?.stdout)?;
+    let commit = String::from_utf8(lab.rewind(&["commit", "-m", "ignored"])?.stdout)?;
+
+    assert!(status.contains("Rewind worktree clean."));
+    assert!(commit.contains("Nothing to commit. Rewind worktree clean."));
+    assert_eq!(lab.event_count()?, 0);
+    Ok(())
+}
+
+#[test]
+fn history_and_timeline_display_dirty_start_information() -> Result<()> {
+    let lab = Lab::new();
+    lab.init()?;
+    fs::write(lab.path().join("scratch.txt"), "manual\n")?;
+    lab.run_allow_dirty(&["sh", "-c", "echo later > other.txt"])?;
+
+    let history = String::from_utf8(lab.rewind(&["history"])?.stdout)?;
+    let timeline = String::from_utf8(lab.rewind(&["timeline"])?.stdout)?;
+
+    assert!(history.contains("DIRTY"));
+    assert!(history.contains("yes"));
+    assert!(timeline.contains("DIRTY"));
+    assert!(timeline.contains("yes"));
     Ok(())
 }

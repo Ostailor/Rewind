@@ -8,6 +8,7 @@ use std::path::Path;
 pub struct Event {
     pub id: i64,
     pub kind: String,
+    pub started_dirty: bool,
     pub timestamp: String,
     pub command: String,
     pub exit_code: i32,
@@ -21,6 +22,7 @@ pub struct Event {
 
 pub struct NewEvent<'a> {
     pub kind: &'a str,
+    pub started_dirty: bool,
     pub timestamp: &'a str,
     pub command: &'a str,
     pub exit_code: i32,
@@ -51,11 +53,12 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
     let tx = conn.transaction().context("starting history transaction")?;
     tx.execute(
         "INSERT INTO events (
-            kind, timestamp, command, exit_code, before_snapshot, after_snapshot,
+            kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
             created_count, modified_count, deleted_count
-        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
         params![
             event.kind,
+            if event.started_dirty { 1 } else { 0 },
             event.timestamp,
             event.command,
             event.exit_code,
@@ -92,7 +95,7 @@ pub fn insert_event(conn: &mut Connection, event: NewEvent<'_>) -> Result<i64> {
 pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
     let mut stmt = conn
         .prepare(
-            "SELECT id, kind, timestamp, command, exit_code, before_snapshot, after_snapshot,
+            "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
                     created_count, modified_count, deleted_count, undone
              FROM events
              ORDER BY id ASC",
@@ -107,7 +110,7 @@ pub fn list_events(conn: &Connection) -> Result<Vec<Event>> {
 
 pub fn get_event(conn: &Connection, event_id: i64) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
                 created_count, modified_count, deleted_count, undone
          FROM events
          WHERE id = ?1",
@@ -150,7 +153,7 @@ pub fn list_changes(conn: &Connection, event_id: i64) -> Result<Vec<FileChange>>
 
 pub fn latest_non_undone_event(conn: &Connection) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
                 created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0
@@ -168,7 +171,7 @@ pub fn latest_non_undone_event_for_head(
     head_snapshot: &str,
 ) -> Result<Option<Event>> {
     conn.query_row(
-        "SELECT id, kind, timestamp, command, exit_code, before_snapshot, after_snapshot,
+        "SELECT id, kind, started_dirty, timestamp, command, exit_code, before_snapshot, after_snapshot,
                 created_count, modified_count, deleted_count, undone
          FROM events
          WHERE undone = 0 AND after_snapshot = ?1
@@ -225,6 +228,7 @@ fn migrate(conn: &Connection) -> Result<()> {
          CREATE TABLE IF NOT EXISTS events (
              id INTEGER PRIMARY KEY,
              kind TEXT NOT NULL DEFAULT 'run',
+             started_dirty INTEGER NOT NULL DEFAULT 0,
              timestamp TEXT NOT NULL,
              command TEXT NOT NULL,
              exit_code INTEGER NOT NULL,
@@ -251,18 +255,12 @@ fn migrate(conn: &Connection) -> Result<()> {
     )
     .context("migrating events database")?;
     ensure_events_kind_column(conn)?;
+    ensure_events_started_dirty_column(conn)?;
     Ok(())
 }
 
 fn ensure_events_kind_column(conn: &Connection) -> Result<()> {
-    let mut stmt = conn
-        .prepare("PRAGMA table_info(events)")
-        .context("checking events columns")?;
-    let columns = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
-        .collect::<rusqlite::Result<Vec<_>>>()
-        .context("reading events columns")?;
-
+    let columns = event_columns(conn)?;
     if !columns.iter().any(|column| column == "kind") {
         conn.execute(
             "ALTER TABLE events ADD COLUMN kind TEXT NOT NULL DEFAULT 'run'",
@@ -274,19 +272,45 @@ fn ensure_events_kind_column(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+fn ensure_events_started_dirty_column(conn: &Connection) -> Result<()> {
+    let columns = event_columns(conn)?;
+    if !columns.iter().any(|column| column == "started_dirty") {
+        conn.execute(
+            "ALTER TABLE events ADD COLUMN started_dirty INTEGER NOT NULL DEFAULT 0",
+            [],
+        )
+        .context("adding events.started_dirty column")?;
+    }
+
+    Ok(())
+}
+
+fn event_columns(conn: &Connection) -> Result<Vec<String>> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info(events)")
+        .context("checking events columns")?;
+    let columns = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<rusqlite::Result<Vec<_>>>()
+        .context("reading events columns")?;
+    Ok(columns)
+}
+
 fn event_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Event> {
-    let undone: i64 = row.get(10)?;
+    let started_dirty: i64 = row.get(2)?;
+    let undone: i64 = row.get(11)?;
     Ok(Event {
         id: row.get(0)?,
         kind: row.get(1)?,
-        timestamp: row.get(2)?,
-        command: row.get(3)?,
-        exit_code: row.get(4)?,
-        before_snapshot: row.get(5)?,
-        after_snapshot: row.get(6)?,
-        created_count: row.get(7)?,
-        modified_count: row.get(8)?,
-        deleted_count: row.get(9)?,
+        started_dirty: started_dirty != 0,
+        timestamp: row.get(3)?,
+        command: row.get(4)?,
+        exit_code: row.get(5)?,
+        before_snapshot: row.get(6)?,
+        after_snapshot: row.get(7)?,
+        created_count: row.get(8)?,
+        modified_count: row.get(9)?,
+        deleted_count: row.get(10)?,
         undone: undone != 0,
     })
 }

@@ -1,9 +1,9 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rewind_core::diff::{diff_snapshots, ChangeType, FileChange};
+use rewind_core::diff::{diff_snapshots, ChangeType, FileChange, SnapshotDiff};
 use rewind_core::object_store::ObjectStore;
 use rewind_core::snapshot::load_snapshot;
-use rewind_core::{history, init, restore, run, status, REWIND_DIR};
+use rewind_core::{commit, history, init, restore, run, status, REWIND_DIR};
 use std::env;
 use std::fs;
 use std::path::Path;
@@ -23,8 +23,16 @@ struct Cli {
 enum Commands {
     Init,
     Run {
+        #[arg(long)]
+        allow_dirty: bool,
         #[arg(required = true, trailing_var_arg = true, allow_hyphen_values = true)]
         command: Vec<String>,
+    },
+    Commit {
+        #[arg(short, long)]
+        message: String,
+        #[arg(long)]
+        dry_run: bool,
     },
     History,
     Timeline,
@@ -66,10 +74,32 @@ fn run_cli() -> Result<()> {
             init::init_project(&project_dir)?;
             println!("initialized .rewind");
         }
-        Commands::Run { command } => {
-            let exit_code = run::run_command(&project_dir, &command)?;
-            if exit_code != 0 {
-                std::process::exit(exit_code);
+        Commands::Run {
+            command,
+            allow_dirty,
+        } => match run::run_command(&project_dir, &command, allow_dirty)? {
+            run::RunOutcome::Ran { exit_code } => {
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+            }
+            run::RunOutcome::Dirty { status } => {
+                print_run_dirty_report(&status);
+                std::process::exit(1);
+            }
+        },
+        Commands::Commit { message, dry_run } => {
+            match commit::commit_worktree(&project_dir, &message, dry_run)? {
+                commit::CommitOutcome::Committed { event_id, .. } => {
+                    println!("created commit event {event_id}");
+                }
+                commit::CommitOutcome::DryRun { diff } => {
+                    println!("Would commit manual changes: {message}");
+                    print_snapshot_diff_groups(&diff);
+                }
+                commit::CommitOutcome::Clean => {
+                    println!("Nothing to commit. Rewind worktree clean.");
+                }
             }
         }
         Commands::History => print_history(&project_dir)?,
@@ -125,6 +155,16 @@ fn run_cli() -> Result<()> {
     Ok(())
 }
 
+fn print_run_dirty_report(status: &status::WorktreeStatus) {
+    println!("Cannot run command: Rewind worktree is dirty.");
+    print_status_groups(status);
+    println!();
+    println!("Record these changes first with:");
+    println!("  rewind commit -m \"describe your changes\"");
+    println!();
+    println!("Or discard/restore them manually, then try again.");
+}
+
 fn print_status(project_dir: &std::path::Path) -> Result<()> {
     let status = status::worktree_status(project_dir)?;
     if status.is_clean() {
@@ -134,6 +174,41 @@ fn print_status(project_dir: &std::path::Path) -> Result<()> {
         print!("{}", status::dirty_report(&status));
     }
     Ok(())
+}
+
+fn print_status_groups(status: &status::WorktreeStatus) {
+    print_str_group("Added", &status.added_files());
+    print_str_group("Modified", &status.modified_files());
+    print_str_group("Deleted", &status.deleted_files());
+    print_string_group("Added directories", &status.diff.added_dirs);
+    print_string_group("Deleted directories", &status.diff.deleted_dirs);
+}
+
+fn print_snapshot_diff_groups(diff: &SnapshotDiff) {
+    let added = diff
+        .changes
+        .iter()
+        .filter(|change| change.change_type == ChangeType::Created)
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>();
+    let modified = diff
+        .changes
+        .iter()
+        .filter(|change| change.change_type == ChangeType::Modified)
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>();
+    let deleted = diff
+        .changes
+        .iter()
+        .filter(|change| change.change_type == ChangeType::Deleted)
+        .map(|change| change.path.as_str())
+        .collect::<Vec<_>>();
+
+    print_str_group("Added", &added);
+    print_str_group("Modified", &modified);
+    print_str_group("Deleted", &deleted);
+    print_string_group("Added directories", &diff.added_dirs);
+    print_string_group("Deleted directories", &diff.deleted_dirs);
 }
 
 fn print_restore_plan(plan: &restore::RestorePlan) {
@@ -169,15 +244,16 @@ fn print_timeline(project_dir: &Path) -> Result<()> {
     let conn = history::ensure_initialized(project_dir)?;
     let events = history::list_events(&conn)?;
     println!(
-        "{:<4}{:<9}{:<21}{:<6}{:<11}{:<28}COMMAND",
-        "ID", "KIND", "TIME", "EXIT", "STATE", "SNAPSHOT TRANSITION"
+        "{:<4}{:<9}{:<7}{:<21}{:<6}{:<11}{:<28}COMMAND",
+        "ID", "KIND", "DIRTY", "TIME", "EXIT", "STATE", "SNAPSHOT TRANSITION"
     );
     for event in events {
         let state = if event.undone { "undone" } else { "active" };
         println!(
-            "{:<4}{:<9}{:<21}{:<6}{:<11}{:<28}{}",
+            "{:<4}{:<9}{:<7}{:<21}{:<6}{:<11}{:<28}{}",
             event.id,
             event.kind,
+            yes_no(event.started_dirty),
             display_time(&event.timestamp),
             event.exit_code,
             state,
@@ -277,17 +353,31 @@ fn print_string_group(title: &str, paths: &[String]) {
     }
 }
 
+fn print_str_group(title: &str, paths: &[&str]) {
+    if paths.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("{title}:");
+    for path in paths {
+        println!("  {path}");
+    }
+}
+
 fn print_history(project_dir: &std::path::Path) -> Result<()> {
     let conn = history::ensure_initialized(project_dir)?;
     let events = history::list_events(&conn)?;
     println!(
-        "{:<4}{:<21}{:<6}{:<9}{:<10}{:<9}COMMAND",
-        "ID", "TIME", "EXIT", "CREATED", "MODIFIED", "DELETED"
+        "{:<4}{:<9}{:<7}{:<21}{:<6}{:<9}{:<10}{:<9}COMMAND",
+        "ID", "KIND", "DIRTY", "TIME", "EXIT", "CREATED", "MODIFIED", "DELETED"
     );
     for event in events {
         println!(
-            "{:<4}{:<21}{:<6}{:<9}{:<10}{:<9}{}{}",
+            "{:<4}{:<9}{:<7}{:<21}{:<6}{:<9}{:<10}{:<9}{}{}",
             event.id,
+            event.kind,
+            yes_no(event.started_dirty),
             display_time(&event.timestamp),
             event.exit_code,
             event.created_count,
@@ -307,9 +397,14 @@ fn print_event(project_dir: &std::path::Path, event_id: i64) -> Result<()> {
     let changes = history::list_changes(&conn, event_id)?;
 
     println!("ID: {}", event.id);
+    println!("Kind: {}", event.kind);
     println!("Command: {}", event.command);
     println!("Timestamp: {}", event.timestamp);
     println!("Exit code: {}", event.exit_code);
+    println!(
+        "Started from dirty worktree: {}",
+        yes_no(event.started_dirty)
+    );
     println!("Before snapshot: {}", event.before_snapshot);
     println!("After snapshot: {}", event.after_snapshot);
     println!("Undone: {}", event.undone);
@@ -335,6 +430,14 @@ fn print_change_group(
 
 fn short_snapshot(snapshot: &str) -> String {
     snapshot.chars().take(6).collect()
+}
+
+fn yes_no(value: bool) -> &'static str {
+    if value {
+        "yes"
+    } else {
+        "no"
+    }
 }
 
 fn display_time(timestamp: &str) -> String {
